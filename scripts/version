@@ -1,0 +1,240 @@
+#!/bin/bash
+
+set -eu
+
+readonly EXIT_USAGE=2
+readonly EXIT_DEPENDENCY=3
+
+usage() {
+    cat <<'EOF'
+Usage: scripts/version [options] VERSION
+
+Prepare tracked release version and build values for review and commit.
+
+Arguments:
+  VERSION                   Numeric X.Y.Z public version
+
+Options:
+  -b, --build-number NUMBER Explicit next build (default: current build + 1)
+  -h, --help                Show this help
+
+Behavior:
+  Requires a clean main branch, runs the complete source checks, and updates
+  VERSION plus BUILD_NUMBER. It does not commit, tag, push, or publish.
+
+Dependencies:
+  awk, chmod, cp, git, make, mktemp, mv, rm, and sed
+
+Exit status:
+  0 success, 1 versioning failure, 2 usage or precondition error,
+  3 missing dependency
+EOF
+}
+
+fail_usage() {
+    printf 'version: %s\n' "$1" >&2
+    printf 'Try version --help for usage.\n' >&2
+    exit "$EXIT_USAGE"
+}
+
+require_command() {
+    if ! command -v "$1" >/dev/null 2>&1; then
+        printf 'version: required command not found: %s\n' "$1" >&2
+        exit "$EXIT_DEPENDENCY"
+    fi
+}
+
+_expand_short_opts() {
+    # $1 = string of short-opt letters that take a value (e.g. "nXHd"); "" for flag-only scripts
+    # $2..$N = "$@"
+    # Populates _EXPANDED; caller does: set -- "${_EXPANDED[@]}"; unset _EXPANDED
+    local value_opts="$1"; shift
+    _EXPANDED=()
+    local passthru=""
+    local arg
+    local rest
+    local c
+    for arg in "$@"; do
+        if [ -n "$passthru" ]; then _EXPANDED+=("$arg"); continue; fi
+        case "$arg" in
+            --)       passthru=1; _EXPANDED+=("$arg") ;;
+            --*|-|"") _EXPANDED+=("$arg") ;;
+            -[a-zA-Z]?*)
+                rest="${arg#-}"
+                while [ -n "$rest" ]; do
+                    c="${rest%"${rest#?}"}"; rest="${rest#?}"
+                    _EXPANDED+=("-$c")
+                    case "$value_opts" in *"$c"*)
+                        [ -n "$rest" ] && _EXPANDED+=("$rest")
+                        rest="" ;;
+                    esac
+                done ;;
+            *)        _EXPANDED+=("$arg") ;;
+        esac
+    done
+}
+
+is_strict_version() {
+    printf '%s\n' "$1" | awk -F. '
+        NF != 3 { exit 1 }
+        $1 !~ /^(0|[1-9][0-9]*)$/ { exit 1 }
+        $2 !~ /^(0|[1-9][0-9]*)$/ { exit 1 }
+        $3 !~ /^(0|[1-9][0-9]*)$/ { exit 1 }
+    '
+}
+
+version_is_lower() {
+    awk -v candidate="$1" -v current="$2" 'BEGIN {
+        split(candidate, left, ".")
+        split(current, right, ".")
+        for (part = 1; part <= 3; part++) {
+            if ((left[part] + 0) < (right[part] + 0)) exit 0
+            if ((left[part] + 0) > (right[part] + 0)) exit 1
+        }
+        exit 1
+    }'
+}
+
+build_number=''
+next_version=''
+next_version_set='false'
+options_enabled='true'
+
+if [ "$#" -gt 0 ]; then
+    _expand_short_opts "b" "$@"
+    set -- "${_EXPANDED[@]}"; unset _EXPANDED
+fi
+
+while [ "$#" -gt 0 ]; do
+    if [ "$options_enabled" = 'false' ]; then
+        [ "$next_version_set" = 'false' ] || fail_usage "unexpected argument: $1"
+        next_version=$1
+        next_version_set='true'
+        shift
+        continue
+    fi
+
+    case "$1" in
+        -b|--build-number)
+            [ "$#" -ge 2 ] && [ -n "$2" ] || fail_usage '--build-number requires a value'
+            build_number=$2
+            shift 2
+            ;;
+        --build-number=*)
+            build_number=${1#*=}
+            [ -n "$build_number" ] || fail_usage '--build-number requires a value'
+            shift
+            ;;
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        --)
+            options_enabled='false'
+            shift
+            ;;
+        -*) fail_usage "unknown option: $1" ;;
+        *)
+            [ "$next_version_set" = 'false' ] || fail_usage "unexpected argument: $1"
+            next_version=$1
+            next_version_set='true'
+            shift
+            ;;
+    esac
+done
+
+[ "$next_version_set" = 'true' ] || fail_usage 'VERSION is required'
+is_strict_version "$next_version" || fail_usage "VERSION must be numeric X.Y.Z: $next_version"
+
+for command_name in awk chmod cp git make mktemp mv rm sed; do
+    require_command "$command_name"
+done
+
+script_directory=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
+repository_root=$(CDPATH='' cd -- "$script_directory/.." && pwd)
+current_version=$(sed -n '1p' "$repository_root/VERSION")
+current_build=$(sed -n '1p' "$repository_root/BUILD_NUMBER")
+
+is_strict_version "$current_version" || fail_usage "tracked VERSION is invalid: $current_version"
+case "$current_build" in
+    ''|*[!0-9]*) fail_usage "tracked BUILD_NUMBER is invalid: $current_build" ;;
+esac
+[ "$current_build" -gt 0 ] || fail_usage "tracked BUILD_NUMBER must be greater than zero: $current_build"
+version_is_lower "$next_version" "$current_version" && \
+    fail_usage "$next_version must not be lower than $current_version"
+
+if [ -z "$build_number" ]; then
+    build_number=$((current_build + 1))
+fi
+case "$build_number" in
+    ''|*[!0-9]*) fail_usage '--build-number must contain only digits' ;;
+esac
+[ "$build_number" -gt "$current_build" ] || \
+    fail_usage "build number $build_number must be greater than $current_build"
+
+branch=$(git -C "$repository_root" symbolic-ref --quiet --short HEAD 2>/dev/null || true)
+[ "$branch" = 'main' ] || fail_usage "version changes require main, not ${branch:-detached HEAD}"
+starting_head=$(git -C "$repository_root" rev-parse HEAD)
+status_output=$(git -C "$repository_root" status --porcelain --untracked-files=normal)
+[ -z "$status_output" ] || {
+    printf '%s\n' "$status_output" >&2
+    fail_usage 'working tree must be clean'
+}
+
+printf '==> Running release source checks before changing version files\n' >&2
+make -C "$repository_root" check
+
+branch=$(git -C "$repository_root" symbolic-ref --quiet --short HEAD 2>/dev/null || true)
+[ "$branch" = 'main' ] || fail_usage 'branch changed while release source checks were running'
+[ "$(git -C "$repository_root" rev-parse HEAD)" = "$starting_head" ] || \
+    fail_usage 'HEAD changed while release source checks were running'
+status_output=$(git -C "$repository_root" status --porcelain --untracked-files=normal)
+[ -z "$status_output" ] || {
+    printf '%s\n' "$status_output" >&2
+    fail_usage 'working tree changed while release source checks were running'
+}
+[ "$(sed -n '1p' "$repository_root/VERSION")" = "$current_version" ] || \
+    fail_usage 'VERSION changed while release source checks were running'
+[ "$(sed -n '1p' "$repository_root/BUILD_NUMBER")" = "$current_build" ] || \
+    fail_usage 'BUILD_NUMBER changed while release source checks were running'
+
+version_temporary=''
+build_temporary=''
+version_backup=''
+build_backup=''
+replacement_started='false'
+cleanup() {
+    if [ "$replacement_started" = 'true' ]; then
+        restore_failed='false'
+        cp "$version_backup" "$repository_root/VERSION" || restore_failed='true'
+        cp "$build_backup" "$repository_root/BUILD_NUMBER" || restore_failed='true'
+        if [ "$restore_failed" = 'true' ]; then
+            printf '%s\n' 'version: could not restore both version files; recover them from Git' >&2
+        fi
+    fi
+    [ -z "$version_temporary" ] || rm -f "$version_temporary"
+    [ -z "$build_temporary" ] || rm -f "$build_temporary"
+    [ -z "$version_backup" ] || rm -f "$version_backup"
+    [ -z "$build_backup" ] || rm -f "$build_backup"
+}
+trap cleanup EXIT HUP INT TERM
+
+version_temporary=$(mktemp "$repository_root/.VERSION.XXXXXX")
+build_temporary=$(mktemp "$repository_root/.BUILD_NUMBER.XXXXXX")
+version_backup=$(mktemp "$repository_root/.VERSION.backup.XXXXXX")
+build_backup=$(mktemp "$repository_root/.BUILD_NUMBER.backup.XXXXXX")
+cp "$repository_root/VERSION" "$version_backup"
+cp "$repository_root/BUILD_NUMBER" "$build_backup"
+printf '%s\n' "$next_version" >"$version_temporary"
+printf '%s\n' "$build_number" >"$build_temporary"
+chmod 644 "$version_temporary" "$build_temporary"
+replacement_started='true'
+mv "$version_temporary" "$repository_root/VERSION"
+mv "$build_temporary" "$repository_root/BUILD_NUMBER"
+replacement_started='false'
+cleanup
+trap - EXIT HUP INT TERM
+
+printf 'Version: %s\n' "$next_version"
+printf 'Build: %s\n' "$build_number"
+printf 'Review and commit VERSION plus BUILD_NUMBER before preparing a release.\n' >&2

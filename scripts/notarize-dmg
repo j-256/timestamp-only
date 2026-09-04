@@ -1,0 +1,316 @@
+#!/bin/bash
+
+set -eu
+
+readonly EXIT_USAGE=2
+readonly EXIT_DEPENDENCY=3
+
+usage() {
+    cat <<'EOF'
+Usage: scripts/notarize-dmg --keychain-profile PROFILE --signing-identity ID DMG
+
+Sign, submit, staple, assess, and checksum a release DMG.
+
+Required options:
+  -p, --keychain-profile PROFILE   notarytool Keychain profile name
+  -s, --signing-identity ID        Developer ID Application identity
+
+Options:
+  -l, --log FILE                   Notarization log output (default: DMG.notary-log.json)
+  -r, --result FILE                Submission result output (default: DMG.notary-result.plist)
+  -h, --help                       Show this help
+
+  An existing DMG.sha256 is replaced only when it exactly describes the input
+  DMG. Once signing begins, that pre-notarization checksum is no longer valid.
+
+Dependencies:
+  macOS with basename, chmod, codesign, dirname, mktemp, mv, plutil, pwd, rm,
+  shasum, spctl, xcrun notarytool, and xcrun stapler; PROFILE must already
+  exist in the login Keychain
+
+Exit status:
+  0 success, 1 notarization failure, 2 usage error, 3 missing dependency
+EOF
+}
+
+fail_usage() {
+    printf 'notarize-dmg: %s\n' "$1" >&2
+    printf 'Try notarize-dmg --help for usage.\n' >&2
+    exit "$EXIT_USAGE"
+}
+
+require_command() {
+    if ! command -v "$1" >/dev/null 2>&1; then
+        printf 'notarize-dmg: required command not found: %s\n' "$1" >&2
+        exit "$EXIT_DEPENDENCY"
+    fi
+}
+
+_expand_short_opts() {
+    # $1 = string of short-opt letters that take a value (e.g. "nXHd"); "" for flag-only scripts
+    # $2..$N = "$@"
+    # Populates _EXPANDED; caller does: set -- "${_EXPANDED[@]}"; unset _EXPANDED
+    local value_opts="$1"; shift
+    _EXPANDED=()
+    local passthru=""
+    local arg
+    local rest
+    local c
+    for arg in "$@"; do
+        if [ -n "$passthru" ]; then _EXPANDED+=("$arg"); continue; fi
+        case "$arg" in
+            --)       passthru=1; _EXPANDED+=("$arg") ;;
+            --*|-|"") _EXPANDED+=("$arg") ;;
+            -[a-zA-Z]?*)
+                rest="${arg#-}"
+                while [ -n "$rest" ]; do
+                    c="${rest%"${rest#?}"}"; rest="${rest#?}"
+                    _EXPANDED+=("-$c")
+                    case "$value_opts" in *"$c"*)
+                        [ -n "$rest" ] && _EXPANDED+=("$rest")
+                        rest="" ;;
+                    esac
+                done ;;
+            *)        _EXPANDED+=("$arg") ;;
+        esac
+    done
+}
+
+keychain_profile=''
+signing_identity=''
+dmg_path=''
+log_path=''
+options_enabled='true'
+result_path=''
+
+if [ "$#" -gt 0 ]; then
+    _expand_short_opts "lprs" "$@"
+    set -- "${_EXPANDED[@]}"; unset _EXPANDED
+fi
+
+while [ "$#" -gt 0 ]; do
+    if [ "$options_enabled" = 'false' ]; then
+        if [ -n "$dmg_path" ]; then
+            fail_usage "unexpected argument: $1"
+        fi
+        dmg_path=$1
+        shift
+        continue
+    fi
+
+    case "$1" in
+        -p|--keychain-profile)
+            [ "$#" -ge 2 ] && [ -n "$2" ] || fail_usage '--keychain-profile requires a value'
+            keychain_profile=$2
+            shift 2
+            ;;
+        --keychain-profile=*)
+            keychain_profile=${1#*=}
+            [ -n "$keychain_profile" ] || fail_usage '--keychain-profile requires a value'
+            shift
+            ;;
+        -l|--log)
+            [ "$#" -ge 2 ] && [ -n "$2" ] || fail_usage '--log requires a value'
+            log_path=$2
+            shift 2
+            ;;
+        --log=*)
+            log_path=${1#*=}
+            [ -n "$log_path" ] || fail_usage '--log requires a value'
+            shift
+            ;;
+        -r|--result)
+            [ "$#" -ge 2 ] && [ -n "$2" ] || fail_usage '--result requires a value'
+            result_path=$2
+            shift 2
+            ;;
+        --result=*)
+            result_path=${1#*=}
+            [ -n "$result_path" ] || fail_usage '--result requires a value'
+            shift
+            ;;
+        -s|--signing-identity)
+            [ "$#" -ge 2 ] && [ -n "$2" ] || fail_usage '--signing-identity requires a value'
+            signing_identity=$2
+            shift 2
+            ;;
+        --signing-identity=*)
+            signing_identity=${1#*=}
+            [ -n "$signing_identity" ] || fail_usage '--signing-identity requires a value'
+            shift
+            ;;
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        --)
+            shift
+            options_enabled='false'
+            ;;
+        -*)
+            fail_usage "unknown option: $1"
+            ;;
+        *)
+            if [ -n "$dmg_path" ]; then
+                fail_usage "unexpected argument: $1"
+            fi
+            dmg_path=$1
+            shift
+            ;;
+    esac
+done
+
+[ "$#" -eq 0 ] || fail_usage "unexpected argument: $1"
+[ -n "$keychain_profile" ] || fail_usage '--keychain-profile is required'
+[ -n "$signing_identity" ] || fail_usage '--signing-identity is required'
+[ -n "$dmg_path" ] || fail_usage 'a DMG path is required'
+
+require_command codesign
+require_command basename
+require_command cat
+require_command chmod
+require_command dirname
+require_command grep
+require_command mktemp
+require_command mv
+require_command plutil
+require_command pwd
+require_command rm
+require_command shasum
+require_command spctl
+require_command xcrun
+
+if [ ! -f "$dmg_path" ]; then
+    printf 'notarize-dmg: DMG not found: %s\n' "$dmg_path" >&2
+    exit 1
+fi
+
+absolute_parent_path() {
+    local path_basename
+    local path_directory
+
+    path_directory=$(dirname "$1")
+    path_basename=$(basename "$1")
+    path_directory=$(CDPATH='' cd -- "$path_directory" 2>/dev/null && pwd -P) || \
+        fail_usage "output directory not found: $path_directory"
+    printf '%s/%s\n' "$path_directory" "$path_basename"
+}
+
+dmg_path=$(absolute_parent_path "$dmg_path")
+
+if [ -z "$result_path" ]; then
+    result_path="$dmg_path.notary-result.plist"
+else
+    result_path=$(absolute_parent_path "$result_path")
+fi
+if [ -z "$log_path" ]; then
+    log_path="$dmg_path.notary-log.json"
+else
+    log_path=$(absolute_parent_path "$log_path")
+fi
+checksum_path="$dmg_path.sha256"
+
+[ "$result_path" != "$log_path" ] || fail_usage '--result and --log must use different paths'
+[ "$result_path" != "$dmg_path" ] || fail_usage '--result must not replace the DMG'
+[ "$log_path" != "$dmg_path" ] || fail_usage '--log must not replace the DMG'
+[ "$result_path" != "$checksum_path" ] || fail_usage '--result must not replace the checksum'
+[ "$log_path" != "$checksum_path" ] || fail_usage '--log must not replace the checksum'
+if [ -e "$result_path" ] || [ -L "$result_path" ]; then
+    fail_usage "result already exists: $result_path"
+fi
+if [ -e "$log_path" ] || [ -L "$log_path" ]; then
+    fail_usage "log already exists: $log_path"
+fi
+result_directory=${result_path%/*}
+log_directory=${log_path%/*}
+[ "$result_directory" != "$result_path" ] || result_directory='.'
+[ "$log_directory" != "$log_path" ] || log_directory='.'
+[ -d "$result_directory" ] || fail_usage "result directory not found: $result_directory"
+[ -d "$log_directory" ] || fail_usage "log directory not found: $log_directory"
+
+if [ -e "$checksum_path" ] || [ -L "$checksum_path" ]; then
+    [ ! -L "$checksum_path" ] || fail_usage "checksum must not be a symbolic link: $checksum_path"
+    [ -f "$checksum_path" ] || fail_usage "checksum is not a regular file: $checksum_path"
+    expected_checksum=$(
+        cd "$(dirname "$dmg_path")"
+        shasum -a 256 "$(basename "$dmg_path")"
+    )
+    existing_checksum=$(cat "$checksum_path")
+    [ "$existing_checksum" = "$expected_checksum" ] || \
+        fail_usage "existing checksum does not describe the input DMG: $checksum_path"
+    rm -f "$checksum_path"
+fi
+
+codesign \
+    --force \
+    --sign "$signing_identity" \
+    --timestamp \
+    "$dmg_path"
+codesign --verify --strict --verbose=2 "$dmg_path"
+
+xcrun notarytool submit \
+    --keychain-profile "$keychain_profile" \
+    --wait \
+    --output-format plist \
+    "$dmg_path" >"$result_path"
+
+submission_status=$(plutil -extract status raw -o - "$result_path")
+submission_id=$(plutil -extract id raw -o - "$result_path")
+if ! xcrun notarytool log \
+    --keychain-profile "$keychain_profile" \
+    "$submission_id" \
+    "$log_path" >/dev/null; then
+    printf 'notarize-dmg: could not retrieve the notarization log for %s\n' "$submission_id" >&2
+    exit 1
+fi
+
+if [ "$submission_status" != 'Accepted' ]; then
+    printf 'notarize-dmg: submission %s finished with status %s\n' \
+        "$submission_id" \
+        "$submission_status" >&2
+    printf '%s\n' '--- Apple notary log ---' >&2
+    cat "$log_path" >&2
+    exit 1
+fi
+
+if grep -Eq '"severity"[[:space:]]*:[[:space:]]*"error"' "$log_path"; then
+    printf 'notarize-dmg: Apple accepted submission %s with an error in its log\n' "$submission_id" >&2
+    cat "$log_path" >&2
+    exit 1
+fi
+
+if grep -Eq '"severity"[[:space:]]*:[[:space:]]*"warning"' "$log_path"; then
+    printf 'notarize-dmg: Apple accepted submission %s with warnings\n' "$submission_id" >&2
+    cat "$log_path" >&2
+fi
+
+xcrun stapler staple "$dmg_path"
+xcrun stapler validate "$dmg_path"
+spctl \
+    --assess \
+    --type open \
+    --context context:primary-signature \
+    --verbose=2 \
+    "$dmg_path"
+
+checksum_directory=${checksum_path%/*}
+[ "$checksum_directory" != "$checksum_path" ] || checksum_directory='.'
+checksum_temporary=$(mktemp "$checksum_directory/.timestamp-only-checksum.XXXXXX")
+cleanup_checksum() {
+    rm -f "$checksum_temporary"
+}
+trap cleanup_checksum EXIT HUP INT TERM
+final_checksum=$(
+    cd "$(dirname "$dmg_path")"
+    shasum -a 256 "$(basename "$dmg_path")"
+)
+printf '%s\n' "$final_checksum" >"$checksum_temporary"
+chmod 644 "$checksum_temporary"
+mv "$checksum_temporary" "$checksum_path"
+trap - EXIT HUP INT TERM
+
+printf 'Accepted submission: %s\n' "$submission_id"
+printf '%s\n' "$dmg_path"
+printf '%s\n' "$checksum_path"
+printf '%s\n' "$result_path"
+printf '%s\n' "$log_path"

@@ -1,0 +1,4 @@
+Timestamp Only is free software licensed under AGPL-3.0-only.
+
+The corresponding source code for released versions is available at:
+https://github.com/j-256/timestamp-only

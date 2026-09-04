@@ -1,0 +1,793 @@
+#!/bin/bash
+
+set -eu
+
+readonly EXIT_USAGE=2
+readonly EXIT_DEPENDENCY=3
+readonly EXPECTED_REPOSITORY='j-256/timestamp-only'
+readonly CI_WORKFLOW='CI'
+readonly DEFAULT_KEYCHAIN_PROFILE='timestamp-only-notary'
+readonly DEFAULT_OUTPUT_DIRECTORY='release-candidates'
+readonly APP_NAME='Timestamp Only.app'
+readonly MANIFEST_NAME='release.plist'
+
+usage() {
+    cat <<'EOF'
+Usage: scripts/release prepare [options]
+       scripts/release publish [options]
+
+Prepare or publish a guarded Timestamp Only release.
+
+Commands:
+  prepare                    Build, sign, notarize, and verify a local candidate
+  publish                    Reverify and publish the prepared candidate
+
+Shared options:
+  -o, --output DIRECTORY     Candidate root (default: release-candidates)
+  -h, --help                 Show this help
+
+Prepare options:
+  -p, --keychain-profile PROFILE
+                             notarytool profile (default: timestamp-only-notary)
+  -s, --signing-identity ID  Developer ID name or fingerprint (default: the only one)
+
+Tracked release identity:
+  VERSION                    Numeric X.Y.Z public version
+  BUILD_NUMBER               Positive, monotonically increasing bundle build
+
+Dependencies:
+  Both commands require git, GitHub CLI authentication, and the dependencies
+  documented by the build and verification scripts. Prepare additionally needs
+  a Developer ID Application identity and a valid notarytool Keychain profile.
+
+Exit status:
+  0 success, 1 release failure, 2 usage or precondition error,
+  3 missing dependency
+EOF
+}
+
+fail_usage() {
+    printf 'release: %s\n' "$1" >&2
+    printf 'Try release --help for usage.\n' >&2
+    exit "$EXIT_USAGE"
+}
+
+fail() {
+    printf 'release: %s\n' "$1" >&2
+    exit 1
+}
+
+require_command() {
+    if ! command -v "$1" >/dev/null 2>&1; then
+        printf 'release: required command not found: %s\n' "$1" >&2
+        exit "$EXIT_DEPENDENCY"
+    fi
+}
+
+progress() {
+    printf '==> %s\n' "$1" >&2
+}
+
+_expand_short_opts() {
+    # $1 = string of short-opt letters that take a value (e.g. "nXHd"); "" for flag-only scripts
+    # $2..$N = "$@"
+    # Populates _EXPANDED; caller does: set -- "${_EXPANDED[@]}"; unset _EXPANDED
+    local value_opts="$1"; shift
+    _EXPANDED=()
+    local passthru=""
+    local arg
+    local rest
+    local c
+    for arg in "$@"; do
+        if [ -n "$passthru" ]; then _EXPANDED+=("$arg"); continue; fi
+        case "$arg" in
+            --)       passthru=1; _EXPANDED+=("$arg") ;;
+            --*|-|"") _EXPANDED+=("$arg") ;;
+            -[a-zA-Z]?*)
+                rest="${arg#-}"
+                while [ -n "$rest" ]; do
+                    c="${rest%"${rest#?}"}"; rest="${rest#?}"
+                    _EXPANDED+=("-$c")
+                    case "$value_opts" in *"$c"*)
+                        [ -n "$rest" ] && _EXPANDED+=("$rest")
+                        rest="" ;;
+                    esac
+                done ;;
+            *)        _EXPANDED+=("$arg") ;;
+        esac
+    done
+}
+
+is_strict_version() {
+    printf '%s\n' "$1" | awk -F. '
+        NF != 3 { exit 1 }
+        $1 !~ /^(0|[1-9][0-9]*)$/ { exit 1 }
+        $2 !~ /^(0|[1-9][0-9]*)$/ { exit 1 }
+        $3 !~ /^(0|[1-9][0-9]*)$/ { exit 1 }
+    '
+}
+
+version_is_greater() {
+    awk -v candidate="$1" -v previous="$2" 'BEGIN {
+        split(candidate, left, ".")
+        split(previous, right, ".")
+        for (part = 1; part <= 3; part++) {
+            if ((left[part] + 0) > (right[part] + 0)) exit 0
+            if ((left[part] + 0) < (right[part] + 0)) exit 1
+        }
+        exit 1
+    }'
+}
+
+find_release_state() {
+    local repository_name
+    local repository_owner
+
+    repository_owner=${EXPECTED_REPOSITORY%%/*}
+    repository_name=${EXPECTED_REPOSITORY#*/}
+    # GraphQL variables are expanded by GitHub, not the shell
+    # shellcheck disable=SC2016
+    github_release_state=$(gh api graphql \
+        -f query='query($owner: String!, $name: String!, $tag: String!) { repository(owner: $owner, name: $name) { release(tagName: $tag) { isDraft } } }' \
+        -f owner="$repository_owner" \
+        -f name="$repository_name" \
+        -f tag="$tag" \
+        --jq '.data.repository.release | if . == null then "absent" elif .isDraft then "draft" else "published" end') || \
+        fail "could not inspect GitHub Release $tag"
+    case "$github_release_state" in
+        absent|draft|published) ;;
+        *) fail "unknown GitHub Release state for $tag" ;;
+    esac
+}
+
+load_tracked_identity() {
+    version=$(sed -n '1p' "$repository_root/VERSION")
+    build_number=$(sed -n '1p' "$repository_root/BUILD_NUMBER")
+
+    is_strict_version "$version" || fail_usage "VERSION must be numeric X.Y.Z: $version"
+    case "$build_number" in
+        ''|*[!0-9]*) fail_usage "BUILD_NUMBER must be a positive integer: $build_number" ;;
+    esac
+    [ "$build_number" -gt 0 ] || fail_usage "BUILD_NUMBER must be greater than zero: $build_number"
+
+    tag="v$version"
+    candidate_directory="$release_root/$tag-$build_number"
+    manifest_path="$candidate_directory/$MANIFEST_NAME"
+    dmg_name="Timestamp-Only-${version}.dmg"
+    checksum_name="$dmg_name.sha256"
+    dmg_path="$candidate_directory/$dmg_name"
+    checksum_path="$candidate_directory/$checksum_name"
+}
+
+check_tag_sequence() {
+    local existing_tag
+    local existing_version
+    local previous_build
+
+    while IFS= read -r existing_tag; do
+        [ -n "$existing_tag" ] || continue
+        existing_version=${existing_tag#v}
+        is_strict_version "$existing_version" || continue
+        version_is_greater "$version" "$existing_version" || \
+            fail_usage "$version must be greater than released version $existing_version"
+
+        previous_build=$(git show "$existing_tag:BUILD_NUMBER" 2>/dev/null || true)
+        case "$previous_build" in
+            ''|*[!0-9]*) continue ;;
+        esac
+        [ "$build_number" -gt "$previous_build" ] || \
+            fail_usage "BUILD_NUMBER $build_number must be greater than $previous_build from $existing_tag"
+    done <<EOF
+$(git tag --list 'v*')
+EOF
+}
+
+check_ci() {
+    local successful_sha
+
+    successful_sha=$(gh run list \
+        --repo "$EXPECTED_REPOSITORY" \
+        --workflow "$CI_WORKFLOW" \
+        --commit "$head_commit" \
+        --status success \
+        --limit 1 \
+        --json headSha \
+        --jq '.[0].headSha // ""') || fail 'could not inspect GitHub CI'
+    [ "$successful_sha" = "$head_commit" ] || \
+        fail "CI has not succeeded for $head_commit"
+}
+
+check_source() {
+    local actual_repository
+    local branch
+    local remote_head
+    local status_output
+
+    branch=$(git symbolic-ref --quiet --short HEAD 2>/dev/null || true)
+    [ "$branch" = 'main' ] || fail_usage "release commands require main, not ${branch:-detached HEAD}"
+
+    status_output=$(git status --porcelain --untracked-files=normal)
+    [ -z "$status_output" ] || {
+        printf '%s\n' "$status_output" >&2
+        fail_usage 'working tree must be clean'
+    }
+
+    actual_repository=$(gh repo view --json nameWithOwner --jq '.nameWithOwner') || \
+        fail 'could not resolve the GitHub repository for origin'
+    [ "$actual_repository" = "$EXPECTED_REPOSITORY" ] || \
+        fail_usage "origin resolves to $actual_repository, not $EXPECTED_REPOSITORY"
+
+    progress 'Refreshing origin/main and release tags'
+    git fetch --quiet origin main --tags || fail 'could not fetch origin/main and tags'
+    head_commit=$(git rev-parse HEAD)
+    remote_head=$(git rev-parse refs/remotes/origin/main 2>/dev/null || true)
+    [ "$head_commit" = "$remote_head" ] || \
+        fail_usage 'main must exactly match origin/main before a release'
+
+    check_ci
+}
+
+check_source_unchanged() {
+    local current_branch
+    local current_head
+    local current_status
+
+    current_branch=$(git symbolic-ref --quiet --short HEAD 2>/dev/null || true)
+    [ "$current_branch" = 'main' ] || fail 'source branch changed during release preparation'
+    current_head=$(git rev-parse HEAD)
+    [ "$current_head" = "$head_commit" ] || fail 'source commit changed during release preparation'
+    current_status=$(git status --porcelain --untracked-files=normal)
+    [ -z "$current_status" ] || {
+        printf '%s\n' "$current_status" >&2
+        fail 'working tree changed during release preparation'
+    }
+}
+
+check_new_release_state() {
+    check_tag_sequence
+    if git show-ref --verify --quiet "refs/tags/$tag"; then
+        fail_usage "tag already exists: $tag"
+    fi
+    if git ls-remote --exit-code --tags origin "refs/tags/$tag" >/dev/null 2>&1; then
+        fail_usage "remote tag already exists: $tag"
+    fi
+    find_release_state
+    if [ "$github_release_state" != 'absent' ]; then
+        fail_usage "GitHub Release already exists: $tag"
+    fi
+    [ ! -e "$candidate_directory" ] || \
+        fail_usage "release candidate already exists: $candidate_directory"
+}
+
+resolve_signing_identity() {
+    local description
+    local fingerprint
+    local identity_count
+    local identity_line
+    local identity_listing
+    local requested_identity
+    local selected_description
+    local selected_fingerprint
+
+    requested_identity=$signing_identity
+    selected_description=''
+    selected_fingerprint=''
+    identity_count=0
+    identity_listing=$(security find-identity \
+        -v \
+        -p codesigning \
+        "$HOME/Library/Keychains/login.keychain-db") || \
+        fail 'could not inspect the login Keychain'
+
+    while IFS= read -r identity_line; do
+        case "$identity_line" in
+            *'"Developer ID Application:'*) ;;
+            *) continue ;;
+        esac
+
+        fingerprint=$(printf '%s\n' "$identity_line" | awk '{print $2}')
+        description=${identity_line#*\"}
+        description=${description%%\"*}
+
+        if [ -n "$requested_identity" ] && \
+            [ "$requested_identity" != "$fingerprint" ] && \
+            [ "$requested_identity" != "$description" ]; then
+            continue
+        fi
+
+        identity_count=$((identity_count + 1))
+        selected_fingerprint=$fingerprint
+        selected_description=$description
+    done <<EOF
+$identity_listing
+EOF
+
+    if [ "$identity_count" -eq 0 ]; then
+        if [ -n "$requested_identity" ]; then
+            fail "Developer ID Application identity is unavailable: $requested_identity"
+        fi
+        fail 'no Developer ID Application identity is available'
+    fi
+    if [ "$identity_count" -ne 1 ]; then
+        fail_usage 'multiple Developer ID Application identities are available; select one with --signing-identity'
+    fi
+
+    team_id=$(printf '%s\n' "$selected_description" | sed -nE 's/^.*\(([A-Z0-9]{10})\)$/\1/p')
+    [ -n "$team_id" ] || fail "could not derive Team ID from identity: $selected_description"
+    signing_identity=$selected_fingerprint
+    signing_description=$selected_description
+}
+
+check_notary_profile() {
+    progress "Validating notary profile $keychain_profile"
+    xcrun notarytool history \
+        --keychain-profile "$keychain_profile" \
+        --output-format json >/dev/null || \
+        fail "notarytool profile failed authentication: $keychain_profile"
+}
+
+write_manifest() {
+    local manifest
+    local notary_result
+    local sha256
+    local submission_id
+
+    manifest=$1
+    notary_result=$2
+    sha256=$(awk 'NF {print $1; exit}' "$staging_directory/$checksum_name")
+    submission_id=$(plutil -extract id raw -o - "$notary_result")
+
+    plutil -create xml1 "$manifest"
+    plutil -insert Repository -string "$EXPECTED_REPOSITORY" "$manifest"
+    plutil -insert Commit -string "$head_commit" "$manifest"
+    plutil -insert Tag -string "$tag" "$manifest"
+    plutil -insert Version -string "$version" "$manifest"
+    plutil -insert BuildNumber -string "$build_number" "$manifest"
+    plutil -insert TeamID -string "$team_id" "$manifest"
+    plutil -insert SigningIdentity -string "$signing_description" "$manifest"
+    plutil -insert DMGName -string "$dmg_name" "$manifest"
+    plutil -insert ChecksumName -string "$checksum_name" "$manifest"
+    plutil -insert SHA256 -string "$sha256" "$manifest"
+    plutil -insert NotarySubmissionID -string "$submission_id" "$manifest"
+}
+
+prepare_release() {
+    local completed
+    local notary_log
+    local notary_result
+    local reservation_directory
+    local staging_app
+    local staging_dmg
+
+    for command_name in awk git gh grep make mkdir mktemp mv plutil security sed shasum swift xcrun; do
+        require_command "$command_name"
+    done
+
+    check_source
+    check_new_release_state
+    resolve_signing_identity
+    check_notary_profile
+
+    mkdir -p "$release_root"
+    reservation_directory="$release_root/.prepare-$tag-$build_number.lock"
+    if ! mkdir "$reservation_directory"; then
+        fail "another preparation owns the release lock: $reservation_directory"
+    fi
+    staging_directory=''
+    completed='false'
+    cleanup_prepare() {
+        if [ "$completed" = 'false' ] && [ -n "$staging_directory" ]; then
+            rm -rf "$staging_directory"
+        fi
+        rmdir "$reservation_directory" 2>/dev/null || true
+    }
+    trap cleanup_prepare EXIT HUP INT TERM
+    staging_directory=$(mktemp -d "$release_root/.prepare.XXXXXX")
+
+    staging_app="$staging_directory/$APP_NAME"
+    staging_dmg="$staging_directory/$dmg_name"
+    notary_result="$staging_directory/notary-result.plist"
+    notary_log="$staging_directory/notary-log.json"
+
+    progress 'Running source and unit checks'
+    make -C "$repository_root" check
+    progress 'Running Thread Sanitizer'
+    swift test --package-path "$repository_root" --sanitize=thread
+    check_source_unchanged
+
+    progress "Building $version ($build_number) with $signing_description"
+    "$script_directory/build-app" \
+        --build-number "$build_number" \
+        --output "$staging_directory" \
+        --signing-identity "$signing_identity" \
+        --version "$version"
+    "$script_directory/verify-app" \
+        --build-number "$build_number" \
+        --release \
+        --team-id "$team_id" \
+        "$staging_app"
+
+    progress 'Creating release DMG'
+    "$script_directory/create-dmg" \
+        --app "$staging_app" \
+        --output "$staging_directory"
+
+    progress 'Signing and notarizing release DMG'
+    "$script_directory/notarize-dmg" \
+        --keychain-profile "$keychain_profile" \
+        --log "$notary_log" \
+        --result "$notary_result" \
+        --signing-identity "$signing_identity" \
+        "$staging_dmg"
+
+    progress 'Performing independent final verification'
+    "$script_directory/verify-dmg" \
+        --build-number "$build_number" \
+        --release \
+        --team-id "$team_id" \
+        "$staging_dmg"
+
+    write_manifest "$staging_directory/$MANIFEST_NAME" "$notary_result"
+    check_source_unchanged
+    [ ! -e "$candidate_directory" ] || \
+        fail "release candidate appeared during preparation: $candidate_directory"
+    mv "$staging_directory" "$candidate_directory"
+    completed='true'
+    rmdir "$reservation_directory"
+    trap - EXIT HUP INT TERM
+
+    printf '%s\n' "$candidate_directory"
+}
+
+read_manifest_value() {
+    plutil -extract "$1" raw -o - "$manifest_path" 2>/dev/null || \
+        fail "release manifest is missing $1"
+}
+
+validate_candidate() {
+    local manifest_build
+    local manifest_checksum
+    local manifest_commit
+    local manifest_dmg
+    local manifest_repository
+    local manifest_sha
+    local manifest_tag
+    local manifest_team
+    local manifest_version
+    local actual_sha
+
+    [ -f "$manifest_path" ] || fail_usage "release manifest not found: $manifest_path"
+    [ -f "$dmg_path" ] || fail "release DMG not found: $dmg_path"
+    [ -f "$checksum_path" ] || fail "release checksum not found: $checksum_path"
+
+    manifest_repository=$(read_manifest_value Repository)
+    manifest_commit=$(read_manifest_value Commit)
+    manifest_tag=$(read_manifest_value Tag)
+    manifest_version=$(read_manifest_value Version)
+    manifest_build=$(read_manifest_value BuildNumber)
+    manifest_team=$(read_manifest_value TeamID)
+    manifest_dmg=$(read_manifest_value DMGName)
+    manifest_checksum=$(read_manifest_value ChecksumName)
+    manifest_sha=$(read_manifest_value SHA256)
+
+    [ "$manifest_repository" = "$EXPECTED_REPOSITORY" ] || fail 'release manifest repository differs'
+    [ "$manifest_commit" = "$head_commit" ] || fail 'release candidate was prepared from a different commit'
+    [ "$manifest_tag" = "$tag" ] || fail 'release manifest tag differs'
+    [ "$manifest_version" = "$version" ] || fail 'release manifest version differs'
+    [ "$manifest_build" = "$build_number" ] || fail 'release manifest build number differs'
+    [ "$manifest_dmg" = "$dmg_name" ] || fail 'release manifest DMG name differs'
+    [ "$manifest_checksum" = "$checksum_name" ] || fail 'release manifest checksum name differs'
+
+    actual_sha=$(shasum -a 256 "$dmg_path" | awk '{print $1}')
+    [ "$actual_sha" = "$manifest_sha" ] || fail 'release DMG does not match its manifest digest'
+    (
+        cd "$candidate_directory"
+        shasum -a 256 -c "$checksum_name"
+    )
+
+    team_id=$manifest_team
+    "$script_directory/verify-dmg" \
+        --build-number "$build_number" \
+        --release \
+        --team-id "$team_id" \
+        "$dmg_path"
+}
+
+inspect_local_tag() {
+    local_tag_present='false'
+    local_tag_commit_value=''
+    if git show-ref --verify --quiet "refs/tags/$tag"; then
+        local_tag_present='true'
+        [ "$(git cat-file -t "$tag")" = 'tag' ] || \
+            fail "local tag is not annotated: $tag"
+        local_tag_commit_value=$(git rev-parse "$tag^{}")
+    fi
+}
+
+inspect_remote_tag() {
+    local remote_lines
+    local peeled_commit
+
+    remote_tag_present='false'
+    remote_tag_commit_value=''
+    remote_lines=$(git ls-remote origin \
+        "refs/tags/$tag" \
+        "refs/tags/$tag^{}") || fail 'could not inspect the remote tag'
+    [ -n "$remote_lines" ] || return 0
+    remote_tag_present='true'
+    peeled_commit=$(printf '%s\n' "$remote_lines" | awk '$2 ~ /\^\{\}$/ {print $1; exit}')
+    [ -n "$peeled_commit" ] || fail "remote tag is not annotated: $tag"
+    remote_tag_commit_value=$peeled_commit
+}
+
+confirm_publication() {
+    local answer
+
+    [ -t 0 ] || fail_usage 'publish requires an interactive terminal'
+    printf 'Publish %s (%s) from %s to %s? [y/N] ' \
+        "$version" \
+        "$build_number" \
+        "$head_commit" \
+        "$EXPECTED_REPOSITORY" >&2
+    read -r answer || answer=''
+    case "$answer" in
+        y|Y|yes|YES|Yes) ;;
+        *) fail 'publication cancelled' ;;
+    esac
+}
+
+confirm_final_publication() {
+    local answer
+    local draft_url
+
+    draft_url=$(gh release view "$tag" \
+        --repo "$EXPECTED_REPOSITORY" \
+        --json url \
+        --jq '.url') || fail 'could not read the draft GitHub Release URL'
+    printf '\nDraft assets match the prepared candidate: %s\n' "$draft_url" >&2
+    printf '%s\n' 'Before continuing, download the draft DMG in a browser and complete the quarantined clean-install checklist.' >&2
+    printf 'Make %s public? [y/N] ' "$tag" >&2
+    read -r answer || answer=''
+    case "$answer" in
+        y|Y|yes|YES|Yes) ;;
+        *) fail "draft retained without publishing: $draft_url" ;;
+    esac
+}
+
+ensure_tag() {
+    inspect_local_tag
+    if [ "$local_tag_present" = 'true' ]; then
+        [ "$local_tag_commit_value" = "$head_commit" ] || fail "local tag points to another commit: $tag"
+    else
+        git tag -a "$tag" -m "$version" || fail "could not create local tag $tag"
+    fi
+
+    inspect_remote_tag
+    if [ "$remote_tag_present" = 'true' ]; then
+        [ "$remote_tag_commit_value" = "$head_commit" ] || fail "remote tag points to another commit: $tag"
+    else
+        progress "Pushing $tag"
+        git push origin "$tag" || fail "could not push $tag"
+    fi
+}
+
+asset_is_listed() {
+    printf '%s\n' "$release_asset_names" | grep -Fx "$1" >/dev/null 2>&1
+}
+
+ensure_draft_assets() {
+    local asset_name
+
+    release_asset_names=$(gh release view "$tag" \
+        --repo "$EXPECTED_REPOSITORY" \
+        --json assets \
+        --jq '.assets[].name') || fail 'could not inspect release assets'
+
+    while IFS= read -r asset_name; do
+        [ -n "$asset_name" ] || continue
+        case "$asset_name" in
+            "$dmg_name"|"$checksum_name") ;;
+            *) fail "release contains an unexpected asset: $asset_name" ;;
+        esac
+    done <<EOF
+$release_asset_names
+EOF
+
+    if ! asset_is_listed "$dmg_name"; then
+        [ "$github_release_state" = 'draft' ] || fail "published release is missing $dmg_name"
+        gh release upload "$tag" "$dmg_path" --repo "$EXPECTED_REPOSITORY" || \
+            fail "could not upload $dmg_name"
+    fi
+    if ! asset_is_listed "$checksum_name"; then
+        [ "$github_release_state" = 'draft' ] || fail "published release is missing $checksum_name"
+        gh release upload "$tag" "$checksum_path" --repo "$EXPECTED_REPOSITORY" || \
+            fail "could not upload $checksum_name"
+    fi
+}
+
+verify_downloaded_assets() {
+    local download_directory
+    local downloaded_checksum
+    local downloaded_dmg
+
+    download_directory=$(mktemp -d "${TMPDIR:-/tmp}/timestamp-only-release-download.XXXXXX")
+    cleanup_download() {
+        rm -rf "$download_directory"
+    }
+    trap cleanup_download EXIT HUP INT TERM
+
+    gh release download "$tag" \
+        --repo "$EXPECTED_REPOSITORY" \
+        --dir "$download_directory" \
+        --pattern "$dmg_name" \
+        --pattern "$checksum_name" || fail 'could not download release assets'
+
+    downloaded_dmg="$download_directory/$dmg_name"
+    downloaded_checksum="$download_directory/$checksum_name"
+    [ -f "$downloaded_dmg" ] || fail 'downloaded DMG is missing'
+    [ -f "$downloaded_checksum" ] || fail 'downloaded checksum is missing'
+    cmp -s "$dmg_path" "$downloaded_dmg" || fail 'downloaded DMG differs from the prepared candidate'
+    cmp -s "$checksum_path" "$downloaded_checksum" || fail 'downloaded checksum differs from the prepared candidate'
+
+    "$script_directory/verify-dmg" \
+        --build-number "$build_number" \
+        --release \
+        --team-id "$team_id" \
+        "$downloaded_dmg"
+
+    trap - EXIT HUP INT TERM
+    cleanup_download
+}
+
+publish_release() {
+    local release_notes
+    local release_url
+
+    for command_name in awk cmp git gh grep mktemp plutil shasum; do
+        require_command "$command_name"
+    done
+
+    check_source
+    validate_candidate
+
+    inspect_local_tag
+    if [ "$local_tag_present" = 'true' ] && [ "$local_tag_commit_value" != "$head_commit" ]; then
+        fail "local tag points to another commit: $tag"
+    fi
+    inspect_remote_tag
+    if [ "$remote_tag_present" = 'true' ] && [ "$remote_tag_commit_value" != "$head_commit" ]; then
+        fail "remote tag points to another commit: $tag"
+    fi
+    find_release_state
+
+    if [ "$github_release_state" != 'published' ]; then
+        confirm_publication
+    fi
+    ensure_tag
+
+    if [ "$github_release_state" = 'absent' ]; then
+        release_notes=$(
+            printf 'Timestamp Only %s (%s) is Developer ID signed, notarized by Apple, and stapled for offline Gatekeeper verification.\n\n' "$version" "$build_number"
+            printf 'SHA-256: %s\n' "$(read_manifest_value SHA256)"
+        )
+        gh release create "$tag" \
+            "$dmg_path" \
+            "$checksum_path" \
+            --repo "$EXPECTED_REPOSITORY" \
+            --verify-tag \
+            --draft \
+            --title "$tag" \
+            --generate-notes \
+            --notes "$release_notes" || fail 'could not create draft GitHub Release'
+        github_release_state='draft'
+    fi
+
+    ensure_draft_assets
+    progress 'Downloading and reverifying GitHub Release assets'
+    verify_downloaded_assets
+
+    if [ "$github_release_state" = 'draft' ]; then
+        confirm_final_publication
+        progress "Publishing $tag"
+        gh release edit "$tag" \
+            --repo "$EXPECTED_REPOSITORY" \
+            --draft=false >/dev/null || fail 'could not publish GitHub Release'
+    fi
+
+    release_url=$(gh release view "$tag" \
+        --repo "$EXPECTED_REPOSITORY" \
+        --json isDraft,url \
+        --jq 'select(.isDraft == false) | .url') || fail 'could not verify the published GitHub Release'
+    [ -n "$release_url" ] || fail 'GitHub Release is still a draft'
+    printf '%s\n' "$release_url"
+}
+
+command_name=''
+output_directory=$DEFAULT_OUTPUT_DIRECTORY
+keychain_profile=$DEFAULT_KEYCHAIN_PROFILE
+signing_identity=''
+
+if [ "$#" -eq 0 ]; then
+    fail_usage 'prepare or publish is required'
+fi
+
+case "$1" in
+    prepare|publish)
+        command_name=$1
+        shift
+        ;;
+    -h|--help)
+        usage
+        exit 0
+        ;;
+    *) fail_usage "unknown command: $1" ;;
+esac
+
+if [ "$#" -gt 0 ]; then
+    _expand_short_opts "ops" "$@"
+    set -- "${_EXPANDED[@]}"; unset _EXPANDED
+fi
+
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        -o|--output)
+            [ "$#" -ge 2 ] && [ -n "$2" ] || fail_usage '--output requires a value'
+            output_directory=$2
+            shift 2
+            ;;
+        --output=*)
+            output_directory=${1#*=}
+            [ -n "$output_directory" ] || fail_usage '--output requires a value'
+            shift
+            ;;
+        -p|--keychain-profile)
+            [ "$command_name" = 'prepare' ] || fail_usage '--keychain-profile is only valid with prepare'
+            [ "$#" -ge 2 ] && [ -n "$2" ] || fail_usage '--keychain-profile requires a value'
+            keychain_profile=$2
+            shift 2
+            ;;
+        --keychain-profile=*)
+            [ "$command_name" = 'prepare' ] || fail_usage '--keychain-profile is only valid with prepare'
+            keychain_profile=${1#*=}
+            [ -n "$keychain_profile" ] || fail_usage '--keychain-profile requires a value'
+            shift
+            ;;
+        -s|--signing-identity)
+            [ "$command_name" = 'prepare' ] || fail_usage '--signing-identity is only valid with prepare'
+            [ "$#" -ge 2 ] && [ -n "$2" ] || fail_usage '--signing-identity requires a value'
+            signing_identity=$2
+            shift 2
+            ;;
+        --signing-identity=*)
+            [ "$command_name" = 'prepare' ] || fail_usage '--signing-identity is only valid with prepare'
+            signing_identity=${1#*=}
+            [ -n "$signing_identity" ] || fail_usage '--signing-identity requires a value'
+            shift
+            ;;
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        --)
+            shift
+            [ "$#" -eq 0 ] || fail_usage "unexpected argument: $1"
+            ;;
+        -*) fail_usage "unknown option: $1" ;;
+        *) fail_usage "unexpected argument: $1" ;;
+    esac
+done
+
+script_directory=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
+repository_root=$(CDPATH='' cd -- "$script_directory/.." && pwd)
+cd "$repository_root"
+case "$output_directory" in
+    /*) release_root=$output_directory ;;
+    *) release_root="$repository_root/$output_directory" ;;
+esac
+
+load_tracked_identity
+
+case "$command_name" in
+    prepare) prepare_release ;;
+    publish) publish_release ;;
+esac

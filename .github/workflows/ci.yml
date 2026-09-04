@@ -1,0 +1,56 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Test (${{ matrix.name }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Apple silicon
+            runner: macos-14
+          - name: Intel
+            runner: macos-15-intel
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install source-check dependencies
+        run: |
+          brew list shellcheck >/dev/null 2>&1 || brew install shellcheck
+          brew list swift-format >/dev/null 2>&1 || brew install swift-format
+      - name: Run source checks
+        run: make check
+
+  package:
+    name: Assemble universal app and DMG
+    needs:
+      - test
+      - thread-sanitizer
+    runs-on: macos-15-intel
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - name: Build and verify distributable structure
+        run: make check-dmg
+
+  thread-sanitizer:
+    name: Thread Sanitizer
+    runs-on: macos-14
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - name: Run tests with Thread Sanitizer
+        run: swift test --sanitize=thread

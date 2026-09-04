@@ -1,0 +1,426 @@
+#!/bin/bash
+
+set -eu
+
+readonly EXIT_USAGE=2
+readonly EXIT_DEPENDENCY=3
+readonly EXPECTED_BUNDLE_IDENTIFIER='dev.j-256.timestamponly'
+readonly EXPECTED_HELPER_IDENTIFIER='dev.j-256.timestamponly.loginitem'
+readonly EXPECTED_DEPLOYMENT_TARGET='11.0'
+
+usage() {
+    cat <<'EOF'
+Usage: scripts/verify-app [options] [APP]
+
+Verify a built Timestamp Only application bundle.
+
+Arguments:
+  APP              App path (default: build/Timestamp Only.app)
+
+Options:
+  -b, --build-number NUMBER  Expected CFBundleVersion (default: BUILD_NUMBER)
+  -r, --release              Require a Developer ID release signature
+  -t, --team-id TEAM_ID      Expected Developer Team ID in release mode
+  -h, --help                 Show this help
+
+Dependencies:
+  macOS with codesign, cmp, grep, iconutil, lipo, plutil, PlistBuddy,
+  and vtool
+
+Exit status:
+  0 success, 1 verification failure, 2 usage error, 3 missing dependency
+EOF
+}
+
+fail_usage() {
+    printf 'verify-app: %s\n' "$1" >&2
+    printf 'Try verify-app --help for usage.\n' >&2
+    exit "$EXIT_USAGE"
+}
+
+require_command() {
+    if ! command -v "$1" >/dev/null 2>&1; then
+        printf 'verify-app: required command not found: %s\n' "$1" >&2
+        exit "$EXIT_DEPENDENCY"
+    fi
+}
+
+_expand_short_opts() {
+    # $1 = string of short-opt letters that take a value (e.g. "nXHd"); "" for flag-only scripts
+    # $2..$N = "$@"
+    # Populates _EXPANDED; caller does: set -- "${_EXPANDED[@]}"; unset _EXPANDED
+    local value_opts="$1"; shift
+    _EXPANDED=()
+    local passthru=""
+    local arg
+    local rest
+    local c
+    for arg in "$@"; do
+        if [ -n "$passthru" ]; then _EXPANDED+=("$arg"); continue; fi
+        case "$arg" in
+            --)       passthru=1; _EXPANDED+=("$arg") ;;
+            --*|-|"") _EXPANDED+=("$arg") ;;
+            -[a-zA-Z]?*)
+                rest="${arg#-}"
+                while [ -n "$rest" ]; do
+                    c="${rest%"${rest#?}"}"; rest="${rest#?}"
+                    _EXPANDED+=("-$c")
+                    case "$value_opts" in *"$c"*)
+                        [ -n "$rest" ] && _EXPANDED+=("$rest")
+                        rest="" ;;
+                    esac
+                done ;;
+            *)        _EXPANDED+=("$arg") ;;
+        esac
+    done
+}
+
+app_argument=''
+app_argument_set='false'
+expected_build_number=''
+expected_team_id=''
+options_enabled='true'
+release_mode='false'
+
+if [ "$#" -gt 0 ]; then
+    _expand_short_opts "bt" "$@"
+    set -- "${_EXPANDED[@]}"; unset _EXPANDED
+fi
+
+while [ "$#" -gt 0 ]; do
+    if [ "$options_enabled" = 'false' ]; then
+        [ "$app_argument_set" = 'false' ] || fail_usage "unexpected argument: $1"
+        [ -n "$1" ] || fail_usage 'app path must not be empty'
+        app_argument=$1
+        app_argument_set='true'
+        shift
+        continue
+    fi
+
+    case "$1" in
+        -b|--build-number)
+            [ "$#" -ge 2 ] && [ -n "$2" ] || fail_usage '--build-number requires a value'
+            expected_build_number=$2
+            shift 2
+            ;;
+        --build-number=*)
+            expected_build_number=${1#*=}
+            [ -n "$expected_build_number" ] || fail_usage '--build-number requires a value'
+            shift
+            ;;
+        -r|--release)
+            release_mode='true'
+            shift
+            ;;
+        -t|--team-id)
+            [ "$#" -ge 2 ] && [ -n "$2" ] || fail_usage '--team-id requires a value'
+            expected_team_id=$2
+            shift 2
+            ;;
+        --team-id=*)
+            expected_team_id=${1#*=}
+            [ -n "$expected_team_id" ] || fail_usage '--team-id requires a value'
+            shift
+            ;;
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        --)
+            options_enabled='false'
+            shift
+            ;;
+        -*)
+            fail_usage "unknown option: $1"
+            ;;
+        *)
+            [ "$app_argument_set" = 'false' ] || fail_usage "unexpected argument: $1"
+            [ -n "$1" ] || fail_usage 'app path must not be empty'
+            app_argument=$1
+            app_argument_set='true'
+            shift
+            ;;
+    esac
+done
+
+require_command codesign
+require_command cmp
+require_command grep
+require_command iconutil
+require_command lipo
+require_command plutil
+require_command vtool
+
+plist_buddy='/usr/libexec/PlistBuddy'
+if [ ! -x "$plist_buddy" ]; then
+    printf 'verify-app: required command not found: %s\n' "$plist_buddy" >&2
+    exit "$EXIT_DEPENDENCY"
+fi
+
+script_directory=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
+repository_root=$(CDPATH='' cd -- "$script_directory/.." && pwd)
+expected_version=$(sed -n '1p' "$repository_root/VERSION")
+if [ -z "$expected_build_number" ]; then
+    expected_build_number=$(sed -n '1p' "$repository_root/BUILD_NUMBER")
+fi
+
+case "$expected_build_number" in
+    ''|*[!0-9]*) fail_usage '--build-number must contain only digits' ;;
+esac
+
+[ "$expected_build_number" -gt 0 ] || fail_usage '--build-number must be greater than zero'
+
+if [ "$release_mode" = 'true' ] && [ -z "$expected_team_id" ]; then
+    fail_usage '--team-id is required with --release'
+fi
+
+if [ "$release_mode" = 'true' ]; then
+    case "$expected_team_id" in
+        *[!A-Z0-9]*) fail_usage '--team-id must contain only uppercase letters and digits' ;;
+    esac
+    [ "${#expected_team_id}" -eq 10 ] || fail_usage '--team-id must contain exactly 10 characters'
+fi
+
+if [ "$release_mode" = 'false' ] && [ -n "$expected_team_id" ]; then
+    fail_usage '--team-id requires --release'
+fi
+
+if [ "$app_argument_set" = 'true' ]; then
+    app_path=$app_argument
+else
+    app_path="$repository_root/build/Timestamp Only.app"
+fi
+
+if [ ! -d "$app_path" ]; then
+    printf 'verify-app: app not found: %s\n' "$app_path" >&2
+    exit 1
+fi
+
+app_info="$app_path/Contents/Info.plist"
+app_binary="$app_path/Contents/MacOS/Timestamp Only"
+privacy_manifest="$app_path/Contents/Resources/PrivacyInfo.xcprivacy"
+app_icon="$app_path/Contents/Resources/AppIcon.icns"
+license_file="$app_path/Contents/Resources/LICENSE.txt"
+source_notice="$app_path/Contents/Resources/SOURCE.txt"
+helper_path="$app_path/Contents/Library/LoginItems/Timestamp Only Login Item.app"
+helper_info="$helper_path/Contents/Info.plist"
+helper_binary="$helper_path/Contents/MacOS/Timestamp Only Login Item"
+
+for required_file in \
+    "$app_info" \
+    "$app_binary" \
+    "$privacy_manifest" \
+    "$app_icon" \
+    "$license_file" \
+    "$source_notice" \
+    "$helper_info" \
+    "$helper_binary"; do
+    if [ ! -e "$required_file" ]; then
+        printf 'verify-app: required bundle item missing: %s\n' "$required_file" >&2
+        exit 1
+    fi
+done
+
+plutil -lint "$app_info" "$helper_info" "$privacy_manifest" >/dev/null
+
+if ! cmp -s "$license_file" "$repository_root/LICENSE"; then
+    printf 'verify-app: bundled license does not match repository license\n' >&2
+    exit 1
+fi
+if ! grep -Fq 'https://github.com/j-256/timestamp-only' "$source_notice"; then
+    printf 'verify-app: corresponding-source notice is missing the repository URL\n' >&2
+    exit 1
+fi
+
+app_identifier=$(plutil -extract CFBundleIdentifier raw -o - "$app_info")
+helper_identifier=$(plutil -extract CFBundleIdentifier raw -o - "$helper_info")
+deployment_target=$(plutil -extract LSMinimumSystemVersion raw -o - "$app_info")
+helper_deployment_target=$(plutil -extract LSMinimumSystemVersion raw -o - "$helper_info")
+app_version=$(plutil -extract CFBundleShortVersionString raw -o - "$app_info")
+helper_version=$(plutil -extract CFBundleShortVersionString raw -o - "$helper_info")
+app_build_number=$(plutil -extract CFBundleVersion raw -o - "$app_info")
+helper_build_number=$(plutil -extract CFBundleVersion raw -o - "$helper_info")
+icon_name=$(plutil -extract CFBundleIconFile raw -o - "$app_info")
+is_agent=$(plutil -extract LSUIElement raw -o - "$app_info")
+prohibits_multiple_instances=$(plutil -extract LSMultipleInstancesProhibited raw -o - "$app_info")
+is_background_helper=$(plutil -extract LSBackgroundOnly raw -o - "$helper_info")
+
+if [ "$app_identifier" != "$EXPECTED_BUNDLE_IDENTIFIER" ]; then
+    printf 'verify-app: unexpected app bundle identifier: %s\n' "$app_identifier" >&2
+    exit 1
+fi
+
+if [ "$helper_identifier" != "$EXPECTED_HELPER_IDENTIFIER" ]; then
+    printf 'verify-app: unexpected helper bundle identifier: %s\n' "$helper_identifier" >&2
+    exit 1
+fi
+
+if [ "$deployment_target" != "$EXPECTED_DEPLOYMENT_TARGET" ]; then
+    printf 'verify-app: unexpected deployment target: %s\n' "$deployment_target" >&2
+    exit 1
+fi
+
+if [ "$helper_deployment_target" != "$EXPECTED_DEPLOYMENT_TARGET" ]; then
+    printf 'verify-app: unexpected helper deployment target: %s\n' "$helper_deployment_target" >&2
+    exit 1
+fi
+
+if [ "$app_version" != "$expected_version" ] || [ "$helper_version" != "$expected_version" ]; then
+    printf 'verify-app: app or helper version does not match VERSION\n' >&2
+    exit 1
+fi
+
+case "$app_build_number" in
+    ''|*[!0-9]*)
+        printf 'verify-app: app build number is not numeric\n' >&2
+        exit 1
+        ;;
+esac
+
+if [ "$helper_build_number" != "$app_build_number" ]; then
+    printf 'verify-app: app and helper build numbers do not match\n' >&2
+    exit 1
+fi
+
+if [ "$app_build_number" != "$expected_build_number" ]; then
+    printf 'verify-app: app build number does not match expected build %s\n' "$expected_build_number" >&2
+    exit 1
+fi
+
+if [ "$icon_name" != 'AppIcon' ]; then
+    printf 'verify-app: unexpected app icon name: %s\n' "$icon_name" >&2
+    exit 1
+fi
+
+if [ "$is_agent" != 'true' ] || [ "$prohibits_multiple_instances" != 'true' ] || [ "$is_background_helper" != 'true' ]; then
+    printf 'verify-app: app or login-item presentation mode is incorrect\n' >&2
+    exit 1
+fi
+
+for binary in "$app_binary" "$helper_binary"; do
+    architectures=$(lipo -archs "$binary")
+    case " $architectures " in
+        *' arm64 '*) ;;
+        *) printf 'verify-app: arm64 slice missing: %s\n' "$binary" >&2; exit 1 ;;
+    esac
+    case " $architectures " in
+        *' x86_64 '*) ;;
+        *) printf 'verify-app: x86_64 slice missing: %s\n' "$binary" >&2; exit 1 ;;
+    esac
+
+    minimum_versions=$(vtool -show-build "$binary" | awk '$1 == "minos" { print $2 }')
+    if [ -z "$minimum_versions" ]; then
+        printf 'verify-app: deployment target not found in binary: %s\n' "$binary" >&2
+        exit 1
+    fi
+    while IFS= read -r minimum_version; do
+        if [ "$minimum_version" != "$EXPECTED_DEPLOYMENT_TARGET" ]; then
+            printf 'verify-app: binary deployment target is %s: %s\n' "$minimum_version" "$binary" >&2
+            exit 1
+        fi
+    done <<EOF
+$minimum_versions
+EOF
+done
+
+codesign --verify --deep --strict --verbose=2 "$app_path"
+
+for bundle in "$app_path" "$helper_path"; do
+    signature_details=$(codesign -d --verbose=4 "$bundle" 2>&1)
+    case "$signature_details" in
+        *'flags='*'runtime'*) ;;
+        *) printf 'verify-app: hardened runtime is missing: %s\n' "$bundle" >&2; exit 1 ;;
+    esac
+
+    if [ "$release_mode" = 'true' ]; then
+        case "$signature_details" in
+            *'Authority=Developer ID Application:'*) ;;
+            *) printf 'verify-app: Developer ID Application authority is missing: %s\n' "$bundle" >&2; exit 1 ;;
+        esac
+        case "$signature_details" in
+            *"TeamIdentifier=$expected_team_id"*) ;;
+            *) printf 'verify-app: signing Team ID does not match %s: %s\n' "$expected_team_id" "$bundle" >&2; exit 1 ;;
+        esac
+        case "$signature_details" in
+            *'Timestamp='*) ;;
+            *) printf 'verify-app: secure timestamp is missing: %s\n' "$bundle" >&2; exit 1 ;;
+        esac
+    fi
+done
+
+verification_directory=$(mktemp -d "${TMPDIR:-/tmp}/timestamp-only-verification.XXXXXX")
+app_entitlements="$verification_directory/app-entitlements.plist"
+helper_entitlements="$verification_directory/helper-entitlements.plist"
+iconset_path="$verification_directory/AppIcon.iconset"
+trap 'rm -rf "$verification_directory"' EXIT HUP INT TERM
+iconutil --convert iconset --output "$iconset_path" "$app_icon"
+if [ ! -f "$iconset_path/icon_512x512@2x.png" ]; then
+    printf 'verify-app: 1024-pixel app icon representation is missing\n' >&2
+    exit 1
+fi
+codesign -d --entitlements "$app_entitlements" --xml "$app_path" 2>/dev/null
+codesign -d --entitlements "$helper_entitlements" --xml "$helper_path" 2>/dev/null
+
+for entitlement in \
+    com.apple.security.app-sandbox \
+    com.apple.security.files.bookmarks.app-scope \
+    com.apple.security.files.user-selected.read-write; do
+    value=$("$plist_buddy" -c "Print :$entitlement" "$app_entitlements")
+    if [ "$value" != 'true' ]; then
+        printf 'verify-app: required entitlement is not true: %s\n' "$entitlement" >&2
+        exit 1
+    fi
+done
+
+for entitlement in \
+    com.apple.security.app-sandbox \
+    com.apple.security.inherit; do
+    value=$("$plist_buddy" -c "Print :$entitlement" "$helper_entitlements")
+    if [ "$value" != 'true' ]; then
+        printf 'verify-app: required helper entitlement is not true: %s\n' "$entitlement" >&2
+        exit 1
+    fi
+done
+
+for forbidden_entitlement in \
+    com.apple.security.get-task-allow \
+    com.apple.security.network.client \
+    com.apple.security.network.server; do
+    for entitlements_file in "$app_entitlements" "$helper_entitlements"; do
+        if "$plist_buddy" -c "Print :$forbidden_entitlement" "$entitlements_file" >/dev/null 2>&1; then
+            printf 'verify-app: forbidden entitlement is present: %s\n' "$forbidden_entitlement" >&2
+            exit 1
+        fi
+    done
+done
+
+for forbidden_helper_entitlement in \
+    com.apple.security.files.bookmarks.app-scope \
+    com.apple.security.files.user-selected.read-write; do
+    if "$plist_buddy" -c "Print :$forbidden_helper_entitlement" "$helper_entitlements" >/dev/null 2>&1; then
+        printf 'verify-app: helper file-access entitlement must be absent: %s\n' "$forbidden_helper_entitlement" >&2
+        exit 1
+    fi
+done
+
+privacy_tracking=$(plutil -extract NSPrivacyTracking raw -o - "$privacy_manifest")
+privacy_collected_types=$(plutil -extract NSPrivacyCollectedDataTypes xml1 -o - "$privacy_manifest")
+if [ "$privacy_tracking" != 'false' ]; then
+    printf 'verify-app: privacy manifest must disable tracking\n' >&2
+    exit 1
+fi
+case "$privacy_collected_types" in
+    *'<array/>'*) ;;
+    *) printf 'verify-app: privacy manifest must declare no collected data\n' >&2; exit 1 ;;
+esac
+for privacy_reason in 3B52.1 CA92.1; do
+    if ! grep -Fq "<string>$privacy_reason</string>" "$privacy_manifest"; then
+        printf 'verify-app: required privacy reason is missing: %s\n' "$privacy_reason" >&2
+        exit 1
+    fi
+done
+
+printf 'Verified %s\n' "$app_path"
+printf 'Architectures: arm64 x86_64\n'
+printf 'Bundle identifier: %s\n' "$app_identifier"
+printf 'Minimum macOS: %s\n' "$deployment_target"

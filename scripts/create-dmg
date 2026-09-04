@@ -1,0 +1,187 @@
+#!/bin/bash
+
+set -eu
+
+readonly EXIT_USAGE=2
+readonly EXIT_DEPENDENCY=3
+readonly VOLUME_NAME='Timestamp Only'
+
+usage() {
+    cat <<'EOF'
+Usage: scripts/create-dmg [options]
+
+Create a drag-to-Applications DMG from a built Timestamp Only app.
+
+Options:
+  -a, --app APP          App path (default: build/Timestamp Only.app)
+  -f, --force            Replace an existing DMG and checksum
+  -o, --output DIRECTORY Destination directory (default: build)
+  -h, --help             Show this help
+
+Dependencies:
+  macOS with ditto, hdiutil, plutil, and shasum
+
+Exit status:
+  0 success, 1 packaging failure, 2 usage error, 3 missing dependency
+EOF
+}
+
+fail_usage() {
+    printf 'create-dmg: %s\n' "$1" >&2
+    printf 'Try create-dmg --help for usage.\n' >&2
+    exit "$EXIT_USAGE"
+}
+
+require_command() {
+    if ! command -v "$1" >/dev/null 2>&1; then
+        printf 'create-dmg: required command not found: %s\n' "$1" >&2
+        exit "$EXIT_DEPENDENCY"
+    fi
+}
+
+_expand_short_opts() {
+    # $1 = string of short-opt letters that take a value (e.g. "nXHd"); "" for flag-only scripts
+    # $2..$N = "$@"
+    # Populates _EXPANDED; caller does: set -- "${_EXPANDED[@]}"; unset _EXPANDED
+    local value_opts="$1"; shift
+    _EXPANDED=()
+    local passthru=""
+    local arg
+    local rest
+    local c
+    for arg in "$@"; do
+        if [ -n "$passthru" ]; then _EXPANDED+=("$arg"); continue; fi
+        case "$arg" in
+            --)       passthru=1; _EXPANDED+=("$arg") ;;
+            --*|-|"") _EXPANDED+=("$arg") ;;
+            -[a-zA-Z]?*)
+                rest="${arg#-}"
+                while [ -n "$rest" ]; do
+                    c="${rest%"${rest#?}"}"; rest="${rest#?}"
+                    _EXPANDED+=("-$c")
+                    case "$value_opts" in *"$c"*)
+                        [ -n "$rest" ] && _EXPANDED+=("$rest")
+                        rest="" ;;
+                    esac
+                done ;;
+            *)        _EXPANDED+=("$arg") ;;
+        esac
+    done
+}
+
+app_path=''
+force='false'
+output_directory='build'
+
+if [ "$#" -gt 0 ]; then
+    _expand_short_opts "ao" "$@"
+    set -- "${_EXPANDED[@]}"; unset _EXPANDED
+fi
+
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        -a|--app)
+            [ "$#" -ge 2 ] && [ -n "$2" ] || fail_usage '--app requires a value'
+            app_path=$2
+            shift 2
+            ;;
+        --app=*)
+            app_path=${1#*=}
+            [ -n "$app_path" ] || fail_usage '--app requires a value'
+            shift
+            ;;
+        -f|--force)
+            force='true'
+            shift
+            ;;
+        -o|--output)
+            [ "$#" -ge 2 ] && [ -n "$2" ] || fail_usage '--output requires a value'
+            output_directory=$2
+            shift 2
+            ;;
+        --output=*)
+            output_directory=${1#*=}
+            [ -n "$output_directory" ] || fail_usage '--output requires a value'
+            shift
+            ;;
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        --)
+            shift
+            break
+            ;;
+        -*)
+            fail_usage "unknown option: $1"
+            ;;
+        *)
+            fail_usage "unexpected argument: $1"
+            ;;
+    esac
+done
+
+[ "$#" -eq 0 ] || fail_usage "unexpected argument: $1"
+
+require_command ditto
+require_command hdiutil
+require_command plutil
+require_command shasum
+
+script_directory=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
+repository_root=$(CDPATH='' cd -- "$script_directory/.." && pwd)
+
+if [ -z "$app_path" ]; then
+    app_path="$repository_root/build/Timestamp Only.app"
+elif [ "${app_path#/}" = "$app_path" ]; then
+    app_path="$repository_root/$app_path"
+fi
+
+case "$output_directory" in
+    /*) ;;
+    *) output_directory="$repository_root/$output_directory" ;;
+esac
+
+if [ ! -d "$app_path" ]; then
+    printf 'create-dmg: app not found: %s\n' "$app_path" >&2
+    exit 1
+fi
+
+version=$(plutil -extract CFBundleShortVersionString raw -o - "$app_path/Contents/Info.plist")
+case "$version" in
+    ''|*[!0-9.]*|.*|*.|*..*)
+        printf 'create-dmg: app has an invalid CFBundleShortVersionString\n' >&2
+        exit 1
+        ;;
+esac
+dmg_path="$output_directory/Timestamp-Only-${version}.dmg"
+checksum_path="$dmg_path.sha256"
+staging_directory=$(mktemp -d "${TMPDIR:-/tmp}/timestamp-only-dmg.XXXXXX")
+trap 'rm -rf "$staging_directory"' EXIT HUP INT TERM
+
+if [ "$force" = 'false' ]; then
+    [ ! -e "$dmg_path" ] || fail_usage "output already exists: $dmg_path"
+    [ ! -e "$checksum_path" ] || fail_usage "output already exists: $checksum_path"
+fi
+
+mkdir -p "$output_directory"
+ditto "$app_path" "$staging_directory/Timestamp Only.app"
+ln -s /Applications "$staging_directory/Applications"
+
+if [ "$force" = 'true' ]; then
+    rm -f "$dmg_path" "$checksum_path"
+fi
+hdiutil create \
+    -volname "$VOLUME_NAME" \
+    -srcfolder "$staging_directory" \
+    -format UDZO \
+    -ov \
+    "$dmg_path" >/dev/null
+
+(
+    cd "$output_directory"
+    shasum -a 256 "$(basename "$dmg_path")" >"$(basename "$checksum_path")"
+)
+
+printf '%s\n' "$dmg_path"
+printf '%s\n' "$checksum_path"

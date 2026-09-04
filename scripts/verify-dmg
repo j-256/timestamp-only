@@ -1,0 +1,268 @@
+#!/bin/bash
+
+set -eu
+
+readonly EXIT_USAGE=2
+readonly EXIT_DEPENDENCY=3
+
+usage() {
+    cat <<'EOF'
+Usage: scripts/verify-dmg [options] [DMG]
+
+Verify the DMG, checksum, app bundle, and Applications shortcut.
+
+Arguments:
+  DMG              DMG path (default: build artifact for VERSION)
+
+Options:
+  -b, --build-number NUMBER  Expected CFBundleVersion (default: BUILD_NUMBER)
+  -r, --release              Require signing, stapling, and Gatekeeper checks
+  -t, --team-id TEAM_ID      Expected Developer Team ID in release mode
+  -h, --help                 Show this help
+
+Dependencies:
+  macOS with hdiutil, readlink, and shasum; release mode also requires
+  codesign, spctl, and xcrun stapler; app verification has its own dependencies
+
+Exit status:
+  0 success, 1 verification failure, 2 usage error, 3 missing dependency
+EOF
+}
+
+fail_usage() {
+    printf 'verify-dmg: %s\n' "$1" >&2
+    printf 'Try verify-dmg --help for usage.\n' >&2
+    exit "$EXIT_USAGE"
+}
+
+require_command() {
+    if ! command -v "$1" >/dev/null 2>&1; then
+        printf 'verify-dmg: required command not found: %s\n' "$1" >&2
+        exit "$EXIT_DEPENDENCY"
+    fi
+}
+
+_expand_short_opts() {
+    # $1 = string of short-opt letters that take a value (e.g. "nXHd"); "" for flag-only scripts
+    # $2..$N = "$@"
+    # Populates _EXPANDED; caller does: set -- "${_EXPANDED[@]}"; unset _EXPANDED
+    local value_opts="$1"; shift
+    _EXPANDED=()
+    local passthru=""
+    local arg
+    local rest
+    local c
+    for arg in "$@"; do
+        if [ -n "$passthru" ]; then _EXPANDED+=("$arg"); continue; fi
+        case "$arg" in
+            --)       passthru=1; _EXPANDED+=("$arg") ;;
+            --*|-|"") _EXPANDED+=("$arg") ;;
+            -[a-zA-Z]?*)
+                rest="${arg#-}"
+                while [ -n "$rest" ]; do
+                    c="${rest%"${rest#?}"}"; rest="${rest#?}"
+                    _EXPANDED+=("-$c")
+                    case "$value_opts" in *"$c"*)
+                        [ -n "$rest" ] && _EXPANDED+=("$rest")
+                        rest="" ;;
+                    esac
+                done ;;
+            *)        _EXPANDED+=("$arg") ;;
+        esac
+    done
+}
+
+dmg_argument=''
+dmg_argument_set='false'
+expected_build_number=''
+expected_team_id=''
+options_enabled='true'
+release_mode='false'
+
+if [ "$#" -gt 0 ]; then
+    _expand_short_opts "bt" "$@"
+    set -- "${_EXPANDED[@]}"; unset _EXPANDED
+fi
+
+while [ "$#" -gt 0 ]; do
+    if [ "$options_enabled" = 'false' ]; then
+        [ "$dmg_argument_set" = 'false' ] || fail_usage "unexpected argument: $1"
+        [ -n "$1" ] || fail_usage 'DMG path must not be empty'
+        dmg_argument=$1
+        dmg_argument_set='true'
+        shift
+        continue
+    fi
+
+    case "$1" in
+        -b|--build-number)
+            [ "$#" -ge 2 ] && [ -n "$2" ] || fail_usage '--build-number requires a value'
+            expected_build_number=$2
+            shift 2
+            ;;
+        --build-number=*)
+            expected_build_number=${1#*=}
+            [ -n "$expected_build_number" ] || fail_usage '--build-number requires a value'
+            shift
+            ;;
+        -r|--release)
+            release_mode='true'
+            shift
+            ;;
+        -t|--team-id)
+            [ "$#" -ge 2 ] && [ -n "$2" ] || fail_usage '--team-id requires a value'
+            expected_team_id=$2
+            shift 2
+            ;;
+        --team-id=*)
+            expected_team_id=${1#*=}
+            [ -n "$expected_team_id" ] || fail_usage '--team-id requires a value'
+            shift
+            ;;
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        --)
+            options_enabled='false'
+            shift
+            ;;
+        -*)
+            fail_usage "unknown option: $1"
+            ;;
+        *)
+            [ "$dmg_argument_set" = 'false' ] || fail_usage "unexpected argument: $1"
+            [ -n "$1" ] || fail_usage 'DMG path must not be empty'
+            dmg_argument=$1
+            dmg_argument_set='true'
+            shift
+            ;;
+    esac
+done
+
+require_command hdiutil
+require_command readlink
+require_command shasum
+
+if [ "$release_mode" = 'true' ]; then
+    require_command codesign
+    require_command spctl
+    require_command xcrun
+fi
+
+script_directory=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
+repository_root=$(CDPATH='' cd -- "$script_directory/.." && pwd)
+version=$(sed -n '1p' "$repository_root/VERSION")
+if [ -z "$expected_build_number" ]; then
+    expected_build_number=$(sed -n '1p' "$repository_root/BUILD_NUMBER")
+fi
+
+case "$expected_build_number" in
+    ''|*[!0-9]*) fail_usage '--build-number must contain only digits' ;;
+esac
+
+[ "$expected_build_number" -gt 0 ] || fail_usage '--build-number must be greater than zero'
+
+if [ "$release_mode" = 'true' ] && [ -z "$expected_team_id" ]; then
+    fail_usage '--team-id is required with --release'
+fi
+
+if [ "$release_mode" = 'true' ]; then
+    case "$expected_team_id" in
+        *[!A-Z0-9]*) fail_usage '--team-id must contain only uppercase letters and digits' ;;
+    esac
+    [ "${#expected_team_id}" -eq 10 ] || fail_usage '--team-id must contain exactly 10 characters'
+fi
+
+if [ "$release_mode" = 'false' ] && [ -n "$expected_team_id" ]; then
+    fail_usage '--team-id requires --release'
+fi
+
+if [ "$dmg_argument_set" = 'true' ]; then
+    dmg_path=$dmg_argument
+else
+    dmg_path="$repository_root/build/Timestamp-Only-${version}.dmg"
+fi
+
+if [ "${dmg_path#/}" = "$dmg_path" ]; then
+    dmg_path="$repository_root/$dmg_path"
+fi
+
+if [ ! -f "$dmg_path" ]; then
+    printf 'verify-dmg: DMG not found: %s\n' "$dmg_path" >&2
+    exit 1
+fi
+
+checksum_path="$dmg_path.sha256"
+if [ ! -f "$checksum_path" ]; then
+    printf 'verify-dmg: checksum not found: %s\n' "$checksum_path" >&2
+    exit 1
+fi
+
+(
+    cd "$(dirname "$dmg_path")"
+    shasum -a 256 -c "$(basename "$checksum_path")"
+)
+hdiutil verify "$dmg_path" >/dev/null
+
+if [ "$release_mode" = 'true' ]; then
+    codesign --verify --strict --verbose=2 "$dmg_path"
+    signature_details=$(codesign -d --verbose=4 "$dmg_path" 2>&1)
+    case "$signature_details" in
+        *'Authority=Developer ID Application:'*) ;;
+        *) printf 'verify-dmg: Developer ID Application authority is missing\n' >&2; exit 1 ;;
+    esac
+    case "$signature_details" in
+        *"TeamIdentifier=$expected_team_id"*) ;;
+        *) printf 'verify-dmg: signing Team ID does not match %s\n' "$expected_team_id" >&2; exit 1 ;;
+    esac
+    case "$signature_details" in
+        *'Timestamp='*) ;;
+        *) printf 'verify-dmg: secure timestamp is missing\n' >&2; exit 1 ;;
+    esac
+
+    xcrun stapler validate "$dmg_path"
+    spctl \
+        --assess \
+        --type open \
+        --context context:primary-signature \
+        --verbose=2 \
+        "$dmg_path"
+fi
+
+mount_point=$(mktemp -d "${TMPDIR:-/tmp}/timestamp-only-mount.XXXXXX")
+is_mounted='false'
+cleanup() {
+    if [ "$is_mounted" = 'true' ]; then
+        hdiutil detach "$mount_point" -quiet || true
+    fi
+    rm -rf "$mount_point"
+}
+trap cleanup EXIT HUP INT TERM
+
+hdiutil attach \
+    -mountpoint "$mount_point" \
+    -readonly \
+    -nobrowse \
+    -noautoopen \
+    "$dmg_path" >/dev/null
+is_mounted='true'
+
+app_path="$mount_point/Timestamp Only.app"
+applications_link="$mount_point/Applications"
+if [ ! -d "$app_path" ]; then
+    printf 'verify-dmg: app missing from mounted image\n' >&2
+    exit 1
+fi
+if [ ! -L "$applications_link" ] || [ "$(readlink "$applications_link")" != '/Applications' ]; then
+    printf 'verify-dmg: Applications shortcut is missing or incorrect\n' >&2
+    exit 1
+fi
+
+verify_app_arguments=(--build-number "$expected_build_number")
+if [ "$release_mode" = 'true' ]; then
+    verify_app_arguments+=(--release --team-id "$expected_team_id")
+fi
+
+"$script_directory/verify-app" "${verify_app_arguments[@]}" "$app_path"
+printf 'Verified %s\n' "$dmg_path"

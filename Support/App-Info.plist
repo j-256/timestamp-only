@@ -1,0 +1,50 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleDevelopmentRegion</key>
+	<string>en</string>
+	<key>CFBundleDisplayName</key>
+	<string>Timestamp Only</string>
+	<key>CFBundleExecutable</key>
+	<string>Timestamp Only</string>
+	<key>CFBundleIdentifier</key>
+	<string>dev.j-256.timestamponly</string>
+	<key>CFBundleIconFile</key>
+	<string>AppIcon</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleName</key>
+	<string>Timestamp Only</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleShortVersionString</key>
+	<string>0.0.0</string>
+	<key>CFBundleVersion</key>
+	<string>0</string>
+	<key>LSApplicationCategoryType</key>
+	<string>public.app-category.utilities</string>
+	<key>LSMinimumSystemVersion</key>
+	<string>11.0</string>
+	<key>LSMultipleInstancesProhibited</key>
+	<true/>
+	<key>LSUIElement</key>
+	<true/>
+	<key>NSDesktopFolderUsageDescription</key>
+	<string>Timestamp Only needs access to the folder where macOS saves your screenshots so it can rename new screenshots.</string>
+	<key>NSDocumentsFolderUsageDescription</key>
+	<string>Timestamp Only needs access when your selected screenshot folder is in Documents.</string>
+	<key>NSDownloadsFolderUsageDescription</key>
+	<string>Timestamp Only needs access when your selected screenshot folder is in Downloads.</string>
+	<key>NSHighResolutionCapable</key>
+	<true/>
+	<key>NSHumanReadableCopyright</key>
+	<string>Copyright 2026 Strange Lasers</string>
+	<key>NSNetworkVolumesUsageDescription</key>
+	<string>Timestamp Only needs access when your selected screenshot folder is on a network volume.</string>
+	<key>NSPrincipalClass</key>
+	<string>NSApplication</string>
+	<key>NSRemovableVolumesUsageDescription</key>
+	<string>Timestamp Only needs access when your selected screenshot folder is on a removable volume.</string>
+</dict>
+</plist>

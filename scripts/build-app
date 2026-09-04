@@ -1,0 +1,354 @@
+#!/bin/bash
+
+set -eu
+
+readonly EXIT_USAGE=2
+readonly EXIT_DEPENDENCY=3
+readonly APP_NAME='Timestamp Only'
+readonly APP_EXECUTABLE='Timestamp Only'
+readonly APP_BUNDLE_IDENTIFIER='dev.j-256.timestamponly'
+readonly HELPER_NAME='Timestamp Only Login Item'
+readonly HELPER_EXECUTABLE='Timestamp Only Login Item'
+readonly DEPLOYMENT_TARGET='11.0'
+
+usage() {
+    cat <<'EOF'
+Usage: scripts/build-app [options]
+
+Build and assemble Timestamp Only.app.
+
+Options:
+  -a, --architecture ARCH      universal, arm64, or x86_64 (default: universal)
+  -b, --build-number NUMBER    CFBundleVersion value (default: BUILD_NUMBER)
+  -c, --configuration CONFIG   debug or release (default: release)
+  -o, --output DIRECTORY       Destination directory (default: build)
+  -s, --signing-identity ID    codesign identity (default: ad-hoc identity -)
+  -V, --version VERSION        App version (default: value in VERSION)
+  -h, --help               Show this help
+
+Dependencies:
+  macOS with Xcode command-line tools, including codesign, iconutil, lipo,
+  plutil, sips, and swift
+
+Exit status:
+  0 success, 1 build failure, 2 usage error, 3 missing dependency
+EOF
+}
+
+fail_usage() {
+    printf 'build-app: %s\n' "$1" >&2
+    printf 'Try build-app --help for usage.\n' >&2
+    exit "$EXIT_USAGE"
+}
+
+require_command() {
+    if ! command -v "$1" >/dev/null 2>&1; then
+        printf 'build-app: required command not found: %s\n' "$1" >&2
+        exit "$EXIT_DEPENDENCY"
+    fi
+}
+
+_expand_short_opts() {
+    # $1 = string of short-opt letters that take a value (e.g. "nXHd"); "" for flag-only scripts
+    # $2..$N = "$@"
+    # Populates _EXPANDED; caller does: set -- "${_EXPANDED[@]}"; unset _EXPANDED
+    local value_opts="$1"; shift
+    _EXPANDED=()
+    local passthru=""
+    local arg
+    local rest
+    local c
+    for arg in "$@"; do
+        if [ -n "$passthru" ]; then _EXPANDED+=("$arg"); continue; fi
+        case "$arg" in
+            --)       passthru=1; _EXPANDED+=("$arg") ;;
+            --*|-|"") _EXPANDED+=("$arg") ;;
+            -[a-zA-Z]?*)
+                rest="${arg#-}"
+                while [ -n "$rest" ]; do
+                    c="${rest%"${rest#?}"}"; rest="${rest#?}"
+                    _EXPANDED+=("-$c")
+                    case "$value_opts" in *"$c"*)
+                        [ -n "$rest" ] && _EXPANDED+=("$rest")
+                        rest="" ;;
+                    esac
+                done ;;
+            *)        _EXPANDED+=("$arg") ;;
+        esac
+    done
+}
+
+architecture='universal'
+build_number=''
+configuration='release'
+output_directory='build'
+signing_identity='-'
+version=''
+
+if [ "$#" -gt 0 ]; then
+    _expand_short_opts "abcosV" "$@"
+    set -- "${_EXPANDED[@]}"; unset _EXPANDED
+fi
+
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        -a|--architecture)
+            [ "$#" -ge 2 ] && [ -n "$2" ] || fail_usage '--architecture requires a value'
+            architecture=$2
+            shift 2
+            ;;
+        --architecture=*)
+            architecture=${1#*=}
+            [ -n "$architecture" ] || fail_usage '--architecture requires a value'
+            shift
+            ;;
+        -b|--build-number)
+            [ "$#" -ge 2 ] && [ -n "$2" ] || fail_usage '--build-number requires a value'
+            build_number=$2
+            shift 2
+            ;;
+        --build-number=*)
+            build_number=${1#*=}
+            [ -n "$build_number" ] || fail_usage '--build-number requires a value'
+            shift
+            ;;
+        -c|--configuration)
+            [ "$#" -ge 2 ] && [ -n "$2" ] || fail_usage '--configuration requires a value'
+            configuration=$2
+            shift 2
+            ;;
+        --configuration=*)
+            configuration=${1#*=}
+            [ -n "$configuration" ] || fail_usage '--configuration requires a value'
+            shift
+            ;;
+        -o|--output)
+            [ "$#" -ge 2 ] && [ -n "$2" ] || fail_usage '--output requires a value'
+            output_directory=$2
+            shift 2
+            ;;
+        --output=*)
+            output_directory=${1#*=}
+            [ -n "$output_directory" ] || fail_usage '--output requires a value'
+            shift
+            ;;
+        -s|--signing-identity)
+            [ "$#" -ge 2 ] && [ -n "$2" ] || fail_usage '--signing-identity requires a value'
+            signing_identity=$2
+            shift 2
+            ;;
+        --signing-identity=*)
+            signing_identity=${1#*=}
+            [ -n "$signing_identity" ] || fail_usage '--signing-identity requires a value'
+            shift
+            ;;
+        -V|--version)
+            [ "$#" -ge 2 ] && [ -n "$2" ] || fail_usage '--version requires a value'
+            version=$2
+            shift 2
+            ;;
+        --version=*)
+            version=${1#*=}
+            [ -n "$version" ] || fail_usage '--version requires a value'
+            shift
+            ;;
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        --)
+            shift
+            break
+            ;;
+        -*)
+            fail_usage "unknown option: $1"
+            ;;
+        *)
+            fail_usage "unexpected argument: $1"
+            ;;
+    esac
+done
+
+[ "$#" -eq 0 ] || fail_usage "unexpected argument: $1"
+
+case "$architecture" in
+    universal|arm64|x86_64) ;;
+    *) fail_usage '--architecture must be universal, arm64, or x86_64' ;;
+esac
+
+case "$configuration" in
+    debug|release) ;;
+    *) fail_usage '--configuration must be debug or release' ;;
+esac
+
+require_command codesign
+require_command iconutil
+require_command lipo
+require_command plutil
+require_command sips
+require_command swift
+
+script_directory=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
+repository_root=$(CDPATH='' cd -- "$script_directory/.." && pwd)
+
+if [ -z "$version" ]; then
+    version=$(sed -n '1p' "$repository_root/VERSION")
+fi
+
+if [ -z "$build_number" ]; then
+    build_number=$(sed -n '1p' "$repository_root/BUILD_NUMBER")
+fi
+
+case "$version" in
+    ''|*[!0-9.]*|.*|*.|*..*) fail_usage '--version must use dot-separated integers' ;;
+esac
+
+case "$build_number" in
+    ''|*[!0-9]*) fail_usage '--build-number must contain only digits' ;;
+esac
+
+[ "$build_number" -gt 0 ] || fail_usage '--build-number must be greater than zero'
+
+case "$output_directory" in
+    /*) ;;
+    *) output_directory="$repository_root/$output_directory" ;;
+esac
+
+app_path="$output_directory/$APP_NAME.app"
+app_contents="$app_path/Contents"
+app_macos="$app_contents/MacOS"
+app_resources="$app_contents/Resources"
+helper_path="$app_contents/Library/LoginItems/$HELPER_NAME.app"
+helper_contents="$helper_path/Contents"
+helper_macos="$helper_contents/MacOS"
+icon_work_directory=$(mktemp -d "${TMPDIR:-/tmp}/timestamp-only-icon.XXXXXX")
+iconset_path="$icon_work_directory/AppIcon.iconset"
+trap 'rm -rf "$icon_work_directory"' EXIT HUP INT TERM
+
+rm -rf "$app_path"
+mkdir -p "$app_macos" "$app_resources" "$helper_macos" "$iconset_path"
+
+build_architecture() {
+    local build_arch
+    local triple
+
+    build_arch=$1
+    triple="${build_arch}-apple-macosx${DEPLOYMENT_TARGET}"
+    swift build \
+        --package-path "$repository_root" \
+        --configuration "$configuration" \
+        --triple "$triple"
+}
+
+binary_path() {
+    local binary_arch
+    local binary_name
+
+    binary_arch=$1
+    binary_name=$2
+    printf '%s/.build/%s-apple-macosx/%s/%s\n' \
+        "$repository_root" \
+        "$binary_arch" \
+        "$configuration" \
+        "$binary_name"
+}
+
+install_product_binary() {
+    local product_name
+    local destination
+
+    product_name=$1
+    destination=$2
+
+    if [ "$architecture" = 'universal' ]; then
+        lipo -create \
+            "$(binary_path arm64 "$product_name")" \
+            "$(binary_path x86_64 "$product_name")" \
+            -output "$destination"
+        chmod 755 "$destination"
+    else
+        install -m 755 "$(binary_path "$architecture" "$product_name")" "$destination"
+    fi
+}
+
+sign_bundle() {
+    local bundle_path
+    local entitlements_path
+
+    bundle_path=$1
+    entitlements_path=$2
+
+    if [ "$signing_identity" = '-' ]; then
+        codesign \
+            --force \
+            --sign "$signing_identity" \
+            --options runtime \
+            --entitlements "$entitlements_path" \
+            "$bundle_path"
+    else
+        codesign \
+            --force \
+            --sign "$signing_identity" \
+            --options runtime \
+            --timestamp \
+            --entitlements "$entitlements_path" \
+            "$bundle_path"
+    fi
+}
+
+render_icon_size() {
+    local filename
+    local pixels
+
+    filename=$1
+    pixels=$2
+    sips \
+        --resampleHeightWidth "$pixels" "$pixels" \
+        "$repository_root/Assets/AppIcon.png" \
+        --out "$iconset_path/$filename" >/dev/null
+}
+
+if [ "$architecture" = 'universal' ]; then
+    build_architecture arm64
+    build_architecture x86_64
+else
+    build_architecture "$architecture"
+fi
+
+install_product_binary TimestampOnly "$app_macos/$APP_EXECUTABLE"
+install_product_binary TimestampOnlyLoginItem "$helper_macos/$HELPER_EXECUTABLE"
+
+install -m 644 "$repository_root/Support/App-Info.plist" "$app_contents/Info.plist"
+install -m 644 "$repository_root/Support/LoginItem-Info.plist" "$helper_contents/Info.plist"
+install -m 644 "$repository_root/LICENSE" "$app_resources/LICENSE.txt"
+install -m 644 "$repository_root/Support/PrivacyInfo.xcprivacy" "$app_resources/PrivacyInfo.xcprivacy"
+install -m 644 "$repository_root/Support/SOURCE.txt" "$app_resources/SOURCE.txt"
+
+render_icon_size icon_16x16.png 16
+render_icon_size icon_16x16@2x.png 32
+render_icon_size icon_32x32.png 32
+render_icon_size icon_32x32@2x.png 64
+render_icon_size icon_128x128.png 128
+render_icon_size icon_128x128@2x.png 256
+render_icon_size icon_256x256.png 256
+render_icon_size icon_256x256@2x.png 512
+render_icon_size icon_512x512.png 512
+render_icon_size icon_512x512@2x.png 1024
+iconutil --convert icns --output "$app_resources/AppIcon.icns" "$iconset_path"
+
+for info_plist in "$app_contents/Info.plist" "$helper_contents/Info.plist"; do
+    plutil -replace CFBundleShortVersionString -string "$version" "$info_plist"
+    plutil -replace CFBundleVersion -string "$build_number" "$info_plist"
+    plutil -lint "$info_plist" >/dev/null
+done
+
+sign_bundle "$helper_path" "$repository_root/Support/LoginItem.entitlements"
+sign_bundle "$app_path" "$repository_root/Support/TimestampOnly.entitlements"
+
+actual_bundle_identifier=$(plutil -extract CFBundleIdentifier raw -o - "$app_contents/Info.plist")
+if [ "$actual_bundle_identifier" != "$APP_BUNDLE_IDENTIFIER" ]; then
+    printf 'build-app: unexpected bundle identifier: %s\n' "$actual_bundle_identifier" >&2
+    exit 1
+fi
+
+printf '%s\n' "$app_path"
