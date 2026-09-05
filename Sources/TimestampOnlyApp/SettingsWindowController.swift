@@ -2,7 +2,6 @@ import AppKit
 import TimestampOnlyCore
 
 enum SettingsRecoveryAction: Equatable {
-    case chooseFolder
     case pause
     case resume
 }
@@ -313,6 +312,14 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate {
         row.alignment = .leading
         row.spacing = 10
         addFullWidth(row, to: stack)
+
+        let menuBarDetail = NSTextField(
+            wrappingLabelWithString:
+                "Closing Settings leaves Timestamp Only running in the menu bar."
+        )
+        menuBarDetail.textColor = .secondaryLabelColor
+        menuBarDetail.maximumNumberOfLines = 2
+        addFullWidth(menuBarDetail, to: stack)
     }
 
     private func configurePrivacySection(in stack: NSStackView) {

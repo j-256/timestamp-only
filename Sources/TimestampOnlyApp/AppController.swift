@@ -330,9 +330,9 @@ final class AppController: NSObject, SettingsWindowControllerDelegate {
     private var recoveryAction: SettingsRecoveryAction? {
         switch state {
         case .folderAccessNeeded:
-            return .chooseFolder
+            return nil
         case .error:
-            return folderAccess.url == nil ? .chooseFolder : .resume
+            return folderAccess.url == nil ? nil : .resume
         case .running:
             return .pause
         case .paused:
@@ -342,8 +342,6 @@ final class AppController: NSObject, SettingsWindowControllerDelegate {
 
     private var recoveryTitle: String? {
         switch recoveryAction {
-        case .chooseFolder:
-            return "Choose Folder..."
         case .pause:
             return "Pause Renaming"
         case .resume:
@@ -467,8 +465,6 @@ final class AppController: NSObject, SettingsWindowControllerDelegate {
         didRequestRecovery action: SettingsRecoveryAction
     ) {
         switch action {
-        case .chooseFolder:
-            settingsWindowDidRequestFolderSelection(controller)
         case .pause:
             pauseRenaming()
         case .resume:
