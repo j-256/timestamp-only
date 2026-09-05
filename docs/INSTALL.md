@@ -2,7 +2,7 @@
 
 ## Direct DMG installation
 
-The primary release artifact is `Timestamp-Only-<version>.dmg`.
+The primary release artifact is `Timestamp-Only-<version>.dmg` on the [GitHub Releases page](https://github.com/j-256/timestamp-only/releases).
 
 1. Download the DMG from the repository's Releases page.
 2. Open the DMG and drag Timestamp Only to Applications.
@@ -12,9 +12,17 @@ The primary release artifact is `Timestamp-Only-<version>.dmg`.
 
 A release is accepted for distribution only after the app and DMG are Developer ID signed, notarized by Apple, and stapled. Apple's notarization service scans distributed software and gives Gatekeeper a ticket it can verify during first launch. See [Apple's notarization overview](https://developer.apple.com/documentation/security/notarizing-macos-software-before-distribution).
 
+On first launch, macOS may confirm that the app was downloaded from the Internet and report that Apple checked it for malicious software. Click Open. A valid release does not require removing quarantine or bypassing Gatekeeper.
+
 ## Homebrew Cask
 
-Homebrew Cask is the planned secondary installation and upgrade path. The Cask will use the same notarized DMG as direct installation, not a separate build or installer. Installation instructions will be added when the Cask is published; a local build or an unpublished Cask should not be treated as a release.
+Homebrew Cask is the secondary installation and upgrade path:
+
+```sh
+brew install --cask j-256/tap/timestamp-only
+```
+
+The Cask downloads the same signed and notarized DMG as the direct installation. It does not use a separate build, package installer, LaunchAgent, or privileged helper.
 
 ## First-run folder access
 
@@ -28,6 +36,11 @@ Timestamp Only does not request Full Disk Access, Screen Recording, Accessibilit
 
 For a direct installation, quit Timestamp Only, download the newer notarized DMG, and replace the copy in Applications. The stable bundle identifier preserves settings and the selected-folder bookmark across ordinary upgrades signed by the same developer identity.
 
-For a Homebrew installation, use the Cask's standard upgrade flow after it is published.
+For a Homebrew installation, update Homebrew and upgrade the Cask:
+
+```sh
+brew update
+brew upgrade --cask timestamp-only
+```
 
 Version 1 does not contain an update framework, perform update checks, or connect to the network. The release format leaves room for a future opt-in updater, but automatic checks will remain disabled unless the user explicitly enables them.

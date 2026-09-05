@@ -15,6 +15,18 @@ Open System Settings, go to General, then Login Items, and disable Timestamp Onl
 
 ## Homebrew removal
 
-After the Cask is published, Homebrew users can remove the app with the Cask's normal uninstall command. A Cask `zap` stanza may remove the sandbox container as an explicit data-removal step; ordinary Cask uninstall should not silently erase preferences.
+First use Prepare for Removal in Timestamp Only so the app can unregister its login item and clear its folder permission. Then remove the Cask:
+
+```sh
+brew uninstall --cask timestamp-only
+```
+
+Ordinary Cask removal preserves the sandbox container. To remove that residual container too, use the explicit `--zap` form:
+
+```sh
+brew uninstall --cask --zap timestamp-only
+```
+
+If the app was removed before Prepare for Removal, follow the System Settings cleanup under "If the app was already deleted" above.
 
 The DMG installs no daemon, privileged helper, kernel or system extension, package receipt, shell profile entry, or file outside the application bundle and sandbox container.

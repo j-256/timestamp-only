@@ -17,6 +17,18 @@ The app is designed to be installed once and forgotten: choose the folder where 
 
 Timestamp Only does not inspect image content, upload files, collect telemetry, or make network connections. It requests read/write access only to the folder you choose.
 
+## Install
+
+The primary installation is the signed and notarized DMG on the [latest release](https://github.com/j-256/timestamp-only/releases/latest): open it, drag Timestamp Only to Applications, and launch the app once to choose your screenshot folder.
+
+Homebrew users can install the identical release artifact through the [j-256 tap](https://github.com/j-256/homebrew-tap):
+
+```sh
+brew install --cask j-256/tap/timestamp-only
+```
+
+See [installation, first run, and updates](docs/INSTALL.md) for the complete walkthrough.
+
 ## Release safety
 
 Only artifacts published on the repository's Releases page through the guarded maintainer workflow are Developer ID signed and notarized for redistribution. Development builds are ad-hoc signed and are not suitable for redistribution.
@@ -37,7 +49,7 @@ All filesystem integration tests use self-created temporary directories. Do not 
 
 The assembled development app is written to `build/Timestamp Only.app`. Development targets use ad-hoc signing and their output must not be distributed. The guarded local release workflow creates a separate Developer ID-signed and notarized candidate under the ignored `release-candidates/` directory; see [Release process](docs/RELEASE.md).
 
-Public releases use numeric SemVer from `VERSION` and a separate monotonically increasing integer build from `BUILD_NUMBER`. The DMG uses the stable name `Timestamp-Only-<version>.dmg` and is accompanied by a SHA-256 checksum suitable for direct distribution and a future Homebrew Cask.
+Public releases use numeric SemVer from `VERSION` and a separate monotonically increasing integer build from `BUILD_NUMBER`. The DMG uses the stable name `Timestamp-Only-<version>.dmg` and is accompanied by a SHA-256 checksum used by direct distribution and the Homebrew Cask.
 
 CI runs the source checks natively on Apple silicon and Intel hosted runners, then assembles and verifies the universal app and DMG. Hosted CI does not substitute for runtime qualification on macOS 11 and 12.
 
