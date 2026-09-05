@@ -30,13 +30,13 @@ Never print, export, upload, or commit certificate private keys, Apple app-speci
 
 ## Prepare tracked version files
 
-The repository's first `0.1.0` release uses build `1`. For each later release, run the guarded version command from a clean `main`:
+Whenever the tracked version or build must advance, run the guarded version command from a clean `main`:
 
 ```sh
 make version V=0.1.1
 ```
 
-This runs the complete source checks, updates `VERSION`, and increments `BUILD_NUMBER`. An explicit larger build can be selected with `BUILD=<integer>`. It does not commit, tag, push, or publish.
+This runs the complete source checks, updates `VERSION`, and increments `BUILD_NUMBER`. Select an explicit larger build with `BUILD=<integer>`, including when replacing an unpublished candidate without changing its public version. It does not commit, tag, push, or publish.
 
 Review and commit only the two version files, then push `main` normally and wait for CI to pass:
 

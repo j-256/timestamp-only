@@ -42,6 +42,6 @@ If a destination already exists, Timestamp Only tries `-1`, then `-2`, and so on
 
 ## Launch at login
 
-Launch at login defaults to off. On macOS 13 and later, the toggle registers the main app through `SMAppService`; Apple documents that [`SMAppService.mainApp`](https://developer.apple.com/documentation/servicemanagement/smappservice/mainapp) represents the main application as a login item. If macOS requires approval, Settings provides a button to open the Login Items panel.
+Launch at login defaults to off. On macOS 13 and later, the toggle registers the main app through `SMAppService`; Apple documents that [`SMAppService.mainApp`](https://developer.apple.com/documentation/servicemanagement/smappservice/mainapp) represents the main application as a login item. A fresh installation can initially report that the service was not found because it has not been registered before; the toggle remains available and registration begins only when you turn it on. If macOS requires approval, Settings provides a button to open the Login Items panel.
 
 On macOS 11 and 12, a minimal bundled login item starts the main app and remains idle. It has no screenshot-folder access. Support for those systems is not advertised until the fallback has passed runtime qualification.

@@ -116,7 +116,7 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate {
         launchAtLogin.state =
             presentation.loginItemState == .enabled
                 || presentation.loginItemState == .approvalRequired ? .on : .off
-        launchAtLogin.isEnabled = presentation.loginItemState != .notFound
+        launchAtLogin.isEnabled = presentation.loginItemState != .unavailable
         loginItemDetail.stringValue = presentation.loginItemState.detail
         loginApprovalButton.isHidden = presentation.loginItemState != .approvalRequired
     }

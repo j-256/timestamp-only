@@ -4,7 +4,7 @@
 
 Timestamp Only is a single, unprivileged, sandboxed AppKit process. It owns the menu-bar status item, Settings window, selected-folder bookmark, FSEvent stream, candidate queue, and same-directory rename operations. Launch Services is configured to prohibit multiple instances of the app. It has no XPC service, privileged helper, package installer, telemetry, screenshot decoder, or network client.
 
-A small embedded login item exists only for the macOS 11 and 12 launch-at-login fallback. It launches the main app and then remains idle; it never receives the folder bookmark or screenshot-folder access. macOS 13 and later register the main app directly with `SMAppService.mainApp`.
+A small embedded login item exists only for the macOS 11 and 12 launch-at-login fallback. It launches the main app and then remains idle; it never receives the folder bookmark or screenshot-folder access. macOS 13 and later register the main app directly with `SMAppService.mainApp`. Service Management can report `.notFound` before it has seen a fresh installation, so that state is presented as off and an opt-in attempts registration. Only an unknown future status disables the control.
 
 ## Compatibility
 

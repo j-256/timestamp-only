@@ -1,12 +1,13 @@
 import AppKit
 import Foundation
 import ServiceManagement
+import TimestampOnlyCore
 
 enum LoginItemState: Equatable {
     case disabled
     case enabled
     case approvalRequired
-    case notFound
+    case unavailable
 
     var detail: String {
         switch self {
@@ -16,8 +17,8 @@ enum LoginItemState: Equatable {
             return "On"
         case .approvalRequired:
             return "Approval needed in System Settings"
-        case .notFound:
-            return "Available after installing a signed release"
+        case .unavailable:
+            return "Launch at login is unavailable for this installation"
         }
     }
 }
@@ -32,7 +33,7 @@ enum LoginItemError: Error, LocalizedError {
             return "macOS could not change the launch-at-login setting."
         case .serviceUnavailable:
             return
-                "Launch at login is available after installing a signed release in Applications."
+                "macOS could not register this copy of Timestamp Only to launch at login. Make sure it is installed in Applications and try again."
         }
     }
 }
@@ -48,17 +49,17 @@ final class LoginItemManager {
 
     var state: LoginItemState {
         if #available(macOS 13.0, *) {
-            switch SMAppService.mainApp.status {
-            case .notRegistered:
+            switch LoginItemPolicy.presentationState(
+                for: serviceStatus(SMAppService.mainApp)
+            ) {
+            case .disabled:
                 return .disabled
             case .enabled:
                 return .enabled
-            case .requiresApproval:
+            case .approvalRequired:
                 return .approvalRequired
-            case .notFound:
-                return .notFound
-            @unknown default:
-                return .notFound
+            case .unavailable:
+                return .unavailable
             }
         }
         return preferences.launchAtLoginRequested ? .enabled : .disabled
@@ -67,26 +68,18 @@ final class LoginItemManager {
     func setEnabled(_ enabled: Bool) throws {
         if #available(macOS 13.0, *) {
             let service = SMAppService.mainApp
-            if enabled {
-                switch service.status {
-                case .notRegistered:
-                    try service.register()
-                case .enabled, .requiresApproval:
-                    break
-                case .notFound:
-                    throw LoginItemError.serviceUnavailable
-                @unknown default:
-                    throw LoginItemError.serviceUnavailable
-                }
-            } else {
-                switch service.status {
-                case .enabled, .requiresApproval:
-                    try service.unregister()
-                case .notRegistered, .notFound:
-                    break
-                @unknown default:
-                    throw LoginItemError.serviceUnavailable
-                }
+            switch LoginItemPolicy.change(
+                to: enabled,
+                from: serviceStatus(service)
+            ) {
+            case .register:
+                try service.register()
+            case .unregister:
+                try service.unregister()
+            case .none:
+                break
+            case .unavailable:
+                throw LoginItemError.serviceUnavailable
             }
         } else {
             guard
@@ -104,6 +97,22 @@ final class LoginItemManager {
     func openApprovalSettings() {
         if #available(macOS 13.0, *) {
             SMAppService.openSystemSettingsLoginItems()
+        }
+    }
+
+    @available(macOS 13.0, *)
+    private func serviceStatus(_ service: SMAppService) -> LoginItemServiceStatus {
+        switch service.status {
+        case .notRegistered:
+            return .notRegistered
+        case .enabled:
+            return .enabled
+        case .requiresApproval:
+            return .requiresApproval
+        case .notFound:
+            return .notFound
+        @unknown default:
+            return .unknown
         }
     }
 }
