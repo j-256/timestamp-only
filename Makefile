@@ -1,11 +1,11 @@
-.PHONY: all app check check-app check-dmg clean dmg lint prepare-release publish-release test test-cli verify-app verify-dmg version
+.PHONY: all app capture-cover check check-app check-dmg clean dmg lint prepare-release publish-release test test-cli verify-app verify-dmg version
 
 all: check check-app
 
 check: lint test
 
 lint:
-	swift format lint --strict --recursive Sources Tests Package.swift
+	swift format lint --strict --recursive Sources Tests tools/cover Package.swift
 	shellcheck scripts/build-app scripts/create-dmg scripts/notarize-dmg scripts/release scripts/version scripts/verify-app scripts/verify-dmg Tests/Scripts/CommandLineTests.sh Tests/Scripts/ReleaseCommandLineTests.sh
 
 test:
@@ -18,6 +18,9 @@ test-cli:
 
 app:
 	scripts/build-app
+
+capture-cover:
+	scripts/capture-cover
 
 verify-app:
 	scripts/verify-app

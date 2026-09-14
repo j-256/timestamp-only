@@ -1,0 +1,69 @@
+#!/usr/bin/env python3
+"""Build and capture the native settings view without starting the application"""
+
+import argparse
+import json
+import os
+from pathlib import Path
+import shutil
+import subprocess
+import sys
+import tempfile
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Render the real settings window with synthetic presentation data to docs/screenshots/cover.png",
+        epilog="Requires macOS, a graphical session, Python 3, and Xcode command-line tools (swift and swiftc). No environment variables. Exit status: 0 success, 1 capture failure, 2 usage error, 3 missing dependency.",
+    )
+    parser.parse_args()
+    if sys.platform != "darwin" or not all(shutil.which(tool) for tool in ("swift", "swiftc")):
+        print("capture-cover: macOS and Xcode command-line tools are required", file=sys.stderr)
+        return 3
+    root = Path(__file__).resolve().parent.parent
+    output = root / "docs/screenshots/cover.png"
+
+    def run(arguments, **kwargs):
+        return subprocess.run(arguments, cwd=root, check=True, timeout=300, **kwargs)
+
+    try:
+        with tempfile.TemporaryDirectory(prefix="timestamp-only-cover-") as temporary:
+            scratch = Path(temporary)
+            build = scratch / "build"
+            run(["swift", "build", "--target", "TimestampOnlyCore", "--scratch-path", str(build)])
+            binaries = Path(run(["swift", "build", "--show-bin-path", "--scratch-path", str(build)], capture_output=True, text=True).stdout.strip())
+            description = json.loads((binaries / "description.json").read_text())
+            compiler = next(command for command in description["swiftCommands"].values() if command["moduleName"] == "TimestampOnlyCore")
+            arguments = compiler["otherArguments"]
+            package_name = arguments[arguments.index("-package-name") + 1]
+            sources = [root / "Sources/TimestampOnlyApp" / name for name in (
+                "SettingsWindowController.swift", "LoginItemManager.swift", "AppPreferences.swift"
+            )]
+            executable = scratch / "capture"
+            run(["swiftc", "-package-name", package_name, "-I", str(binaries / "Modules"),
+                 *map(str, sorted((binaries / "TimestampOnlyCore.build").glob("*.o"))),
+                 *map(str, sources), str(root / "tools/cover/main.swift"),
+                 "-framework", "AppKit", "-framework", "ServiceManagement",
+                 "-framework", "CoreServices", "-framework", "UniformTypeIdentifiers",
+                 "-o", str(executable)])
+            rendered = scratch / "cover.png"
+            run([str(executable), str(rendered)])
+            if rendered.read_bytes()[:8] != b"\x89PNG\r\n\x1a\n":
+                raise RuntimeError("Native view did not produce a PNG")
+            output.parent.mkdir(parents=True, exist_ok=True)
+            with tempfile.NamedTemporaryFile(dir=output.parent, suffix=".png", delete=False) as staged:
+                try:
+                    staged.write(rendered.read_bytes())
+                    staged.close()
+                    os.replace(staged.name, output)
+                finally:
+                    Path(staged.name).unlink(missing_ok=True)
+            print(f"Captured native settings: {output}")
+        return 0
+    except (OSError, RuntimeError, KeyError, ValueError, StopIteration, subprocess.SubprocessError) as error:
+        print(f"capture-cover: {error}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
