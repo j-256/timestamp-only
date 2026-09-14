@@ -36,12 +36,17 @@ def main():
             compiler = next(command for command in description["swiftCommands"].values() if command["moduleName"] == "TimestampOnlyCore")
             arguments = compiler["otherArguments"]
             package_name = arguments[arguments.index("-package-name") + 1]
+            platform_arguments = []
+            for flag in ("-sdk", "-target"):
+                if flag in arguments:
+                    platform_arguments.extend((flag, arguments[arguments.index(flag) + 1]))
             sources = [root / "Sources/TimestampOnlyApp" / name for name in (
                 "SettingsWindowController.swift", "LoginItemManager.swift", "AppPreferences.swift"
             )]
             executable = scratch / "capture"
             module_directory = Path(compiler["moduleOutputPath"]).parent
             run([compiler.get("executable", "swiftc"), "-package-name", package_name, "-I", str(module_directory),
+                 *platform_arguments,
                  *compiler["objects"],
                  *map(str, sources), str(root / "tools/cover/main.swift"),
                  "-framework", "AppKit", "-framework", "ServiceManagement",
