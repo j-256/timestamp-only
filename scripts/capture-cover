@@ -40,8 +40,9 @@ def main():
                 "SettingsWindowController.swift", "LoginItemManager.swift", "AppPreferences.swift"
             )]
             executable = scratch / "capture"
-            run(["swiftc", "-package-name", package_name, "-I", str(binaries / "Modules"),
-                 *map(str, sorted((binaries / "TimestampOnlyCore.build").glob("*.o"))),
+            module_directory = Path(compiler["moduleOutputPath"]).parent
+            run([compiler.get("executable", "swiftc"), "-package-name", package_name, "-I", str(module_directory),
+                 *compiler["objects"],
                  *map(str, sources), str(root / "tools/cover/main.swift"),
                  "-framework", "AppKit", "-framework", "ServiceManagement",
                  "-framework", "CoreServices", "-framework", "UniformTypeIdentifiers",
