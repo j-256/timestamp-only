@@ -41,7 +41,7 @@ guard let view = controller.window?.contentView?.superview else {
     fatalError("Settings window has no content view")
 }
 view.layoutSubtreeIfNeeded()
-let scale = 2
+let scale = 4
 guard
     let bitmap = NSBitmapImageRep(
         bitmapDataPlanes: nil,
